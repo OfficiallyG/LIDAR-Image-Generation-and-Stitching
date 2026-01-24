@@ -1,5 +1,4 @@
-import sys  # Access to command-line args and application exit
-
+import sys
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication,        # Required for PyQt application
