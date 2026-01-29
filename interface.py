@@ -1,5 +1,8 @@
 import sys
-from PyQt6.QtCore import Qt
+import numpy as np       #Numerical arrays for point data
+import pyqtgraph.opengl as gl       #OpenGL 3D widgets for PyQt
+from plyfile import PlyData         #Reads .PLY point cloud files
+from PyQt6.QtCore import Qt         #
 from PyQt6.QtWidgets import (
     QApplication,        # Required for PyQt application
     QMainWindow,         # Main window container
@@ -46,6 +49,61 @@ QScrollBar:vertical { background: #121212; }
 # Task 5 (Stitching):
 #   - Consume file paths from scan queue and output stitched result
 
+class SimplePLYViewport(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # Layout so the viewport fills the available space
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # OpenGL 3D view widget (handles mouse interaction automatically)
+        self.view = gl.GLViewWidget()
+        self.view.setCameraPosition(distance=30)  # camera distance from scene
+        layout.addWidget(self.view)
+
+        # Scatter plot item IS the point cloud renderer
+        self.points = gl.GLScatterPlotItem()
+        self.view.addItem(self.points)
+
+    # ✅ IMPORTANT: load_ply must be aligned with __init__ (same indentation level)
+    def load_ply(self, path: str):
+        # Read the PLY file
+        ply = PlyData.read(path)
+
+        # Access vertex data
+        vertices = ply["vertex"].data
+
+        # Extract XYZ positions into (N,3) array
+        pos = np.vstack((
+            vertices["x"],
+            vertices["y"],
+            vertices["z"]
+        )).T.astype(np.float32)
+
+        # If the PLY contains RGB, use it
+        if all(name in vertices.dtype.names for name in ("red", "green", "blue")):
+            rgb = np.vstack((
+                vertices["red"],
+                vertices["green"],
+                vertices["blue"]
+            )).T.astype(np.float32)
+
+            # Normalize colors if stored as 0–255
+            if rgb.max() > 1.0:
+                rgb /= 255.0
+
+            # Add alpha channel (RGBA)
+            color = np.hstack((
+                rgb,
+                np.ones((rgb.shape[0], 1), dtype=np.float32)
+            ))
+        else:
+            # Default color if no RGB exists
+            color = (1, 1, 1, 1)
+
+        # Send point data to OpenGL
+        self.points.setData(pos=pos, color=color, size=2)
 
 class LidarWindow(QMainWindow):
     def __init__(self):
@@ -66,7 +124,7 @@ class LidarWindow(QMainWindow):
         # Initial log message
         self._log("UI initialized. Ready.")
 
-    # UI Construction
+        # UI Construction
     def _build_ui(self):
         # Root widget is required to apply layouts inside QMainWindow
         root = QWidget()
@@ -100,18 +158,12 @@ class LidarWindow(QMainWindow):
 
         # CENTER PANEL — Viewport Placeholder
         center = QVBoxLayout()
-        main_layout.addLayout(center, 3)  # Center will be the largest section
-
-        # 3D Viewport Placeholder
-        self.viewport = QLabel(
-            "3D Viewport Placeholder\n\n"
-            "• Rotate / Pan / Zoom\n"
-            "• Display .PLY point clouds"
-        )
-        self.viewport.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.viewport.setStyleSheet("border: 2px dashed #666; padding: 18px;")
-        center.addWidget(self.viewport, 1)
-
+        main_layout.addLayout(center, 3)  # Center column
+        
+        # REAL 3D viewport replaces the QLabel
+        self.viewport3d = SimplePLYViewport()
+        center.addWidget(self.viewport3d, 1)
+        
         # RIGHT PANEL — Controls, Info, Status
         right = QVBoxLayout()
         main_layout.addLayout(right, 1)
@@ -180,6 +232,10 @@ class LidarWindow(QMainWindow):
         self.log_lbl.setMinimumHeight(140)
         self.log_lbl.setStyleSheet("border: 1px solid #999; padding: 8px;")
         right.addWidget(self.log_lbl, 1)
+        
+        # Precheck dark mode box
+        self._apply_dark_theme(self.chk_dark_bg.isChecked())
+
 
     # Minimal Signal Wiring
     def _wire_min_signals(self):
@@ -199,16 +255,7 @@ class LidarWindow(QMainWindow):
 
     # Import Local — REAL File Picker
     def _import_local_clicked(self):
-        # Opens a native OS file picker and allows the user to select
-        # one or more .PLY files.
-        #
-        # Responsibilities of this function:
-        # - Open dialog
-        # - Validate extension
-        # - Add filenames to scan queue
-        # - Optionally auto-select newest file
-
-        # Open native file picker dialog
+        # 1) Open file picker FIRST
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Select LiDAR Scan(s)",
@@ -216,40 +263,24 @@ class LidarWindow(QMainWindow):
             "PLY Files (*.ply);;All Files (*)"
         )
 
-        # If user cancels dialog, file_paths will be empty
+        # 2) If canceled, stop
         if not file_paths:
             self._log("Import canceled.")
             return
 
-        # Loop through all selected files
+        # 3) Add filenames to the list
         for path in file_paths:
-            # Extract just the filename (UI-friendly)
             filename = path.split("/")[-1]
-
-            # Add filename to scan queue list
             self.scan_list.addItem(filename)
-
-            # Log import event
             self._log(f"Imported local file: {filename}")
 
-            # LEON! NEXT STEP:
-            # Store the *full path* instead of just filename.
-
-        # Auto-load behavior: select last imported item
+        # 4) Auto-load newest (last selected)
         if self.auto_load_chk.isChecked():
-            last_index = self.scan_list.count() - 1
-            self.scan_list.setCurrentRow(last_index)
+            newest_path = file_paths[-1]
+            self.viewport3d.load_ply(newest_path)
+            self.info_lbl.setText(f"Loaded file:\n{newest_path.split('/')[-1]}")
+            self._log("Loaded newest imported file into 3D viewport.")
 
-            # Update File Info panel (placeholder)
-            self.info_lbl.setText(
-                f"File: {self.scan_list.item(last_index).text()}\n"
-                f"Points: (TODO)\n"
-                f"Has color: (TODO)"
-            )
-
-            self._log("Auto-load enabled: selected newest imported file.")
-
-    # Delete Selected Files
     def _delete_selected_clicked(self):
         # Remove each selected item from the scan queue
         for item in self.scan_list.selectedItems():
@@ -279,7 +310,6 @@ class LidarWindow(QMainWindow):
             app.setStyleSheet(DARK_STYLESHEET)
         else:
             app.setStyleSheet("")
-
 
 def main():
     # Create Qt application
