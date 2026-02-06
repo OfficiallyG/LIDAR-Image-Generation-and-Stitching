@@ -1,24 +1,29 @@
 import sys
-import numpy as np       #Numerical arrays for point data
-import pyqtgraph.opengl as gl       #OpenGL 3D widgets for PyQt
-from plyfile import PlyData         #Reads .PLY point cloud files
-from PyQt6.QtCore import Qt         #
+import os
+import socket
+import struct
+from pathlib import Path
+from typing import Optional
+import numpy as np
+import pyqtgraph.opengl as gl
+from plyfile import PlyData
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QApplication,        # Required for PyQt application
-    QMainWindow,         # Main window container
-    QWidget,             # Base widget used as central container
-    QHBoxLayout,         # Horizontal layout (left | center | right)
-    QVBoxLayout,         # Vertical layout (stacked widgets)
-    QGroupBox,           # Titled UI sections
-    QLabel,              # Text / display widget
-    QPushButton,         # Clickable button
-    QListWidget,         # List widget for scan queue
-    QProgressBar,        # Progress indicator (future use for file upload etc)
-    QCheckBox,           # Toggle options
-    QFileDialog          # Native OS file picker dialog
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QGroupBox,
+    QLabel,
+    QPushButton,
+    QListWidget,
+    QListWidgetItem,
+    QProgressBar,
+    QCheckBox,
+    QFileDialog
 )
 
-# Dark background checkbox in the Render Controls group.
 DARK_STYLESHEET = """
 QWidget { background-color: #121212; color: #e0e0e0; }
 QGroupBox { border: 1px solid #333; margin-top: 6px; }
@@ -29,59 +34,180 @@ QLabel, QCheckBox { color: #e0e0e0; }
 QLineEdit { background-color: #1b1b1b; color: #e0e0e0; }
 QScrollBar:vertical { background: #121212; }
 """
+#Dark-mode theme for the whole app
 
-# NEXT STEPS!
-#
-# Task 1 (UI Designer)
-#   - Works on layout consistency, labels, grouping, UX polish
-#
-# Task 2 (3D viewport)
-#   - Replace the CENTER "viewport" QLabel with pyqtgraph.opengl
-#   - Hook render + view controls to the viewport
-#
-# Task 3 (File Picker & Queue Data):
-#   - Expand import logic (metadata, duplicate handling, previews)
-#   - Store full file paths using QListWidgetItem.setData(Qt.UserRole, path)
-#
-# Task 4 (Raspberry Pi / Networking):
-#   - Add "Receive from Pi" button + background TCP thread
-#
-# Task 5 (Stitching):
-#   - Consume file paths from scan queue and output stitched result
+
+def get_desktop_path() -> Path:
+    #Finds a Desktop path that works on common Windows setups
+    home = Path.home()
+    candidates = [
+        home / "Desktop",
+        home / "OneDrive" / "Desktop",
+        home / "OneDrive - Personal" / "Desktop",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return home
+    #Fallback if Desktop not found
+
+
+INBOX_DIR = get_desktop_path() / "LiDAR_Inbox"
+#Incoming .ply files land here
+INBOX_DIR.mkdir(parents=True, exist_ok=True)
+#Auto-create inbox folder if missing
+RECV_HOST = "0.0.0.0"
+#Listen on all network interfaces
+RECV_PORT = 5001
+#Must match sender port
+
+
+def recv_exact(conn: socket.socket, n: int) -> bytes:
+    #Reads exactly n bytes or raises if the connection closes.
+    data = b""
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("Connection closed while receiving data")
+        data += chunk
+    return data
+
+
+class ReceiverWorker(QThread):
+    file_received = pyqtSignal(str)
+    #Emits saved file path for UI updates
+    log = pyqtSignal(str)
+    #Emits status messages
+    error = pyqtSignal(str)
+    #Emits error messages
+
+    def __init__(self, host: str, port: int, inbox_dir: Path, parent=None):
+        super().__init__(parent)
+        self.host = host
+        self.port = port
+        self.inbox_dir = inbox_dir
+        self._running = True
+        #Loop control flag
+        self._server_socket: Optional[socket.socket] = None
+        #Used to interrupt accept() on stop
+
+    def stop(self):
+        self._running = False
+        #Signals thread loop to exit
+        try:
+            if self._server_socket:
+                self._server_socket.close()
+                #Forces accept() to break quickly
+        except Exception:
+            pass
+
+    def run(self):
+        inbox = self.inbox_dir
+        inbox.mkdir(parents=True, exist_ok=True)
+        #Ensure inbox exists before receiving
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                self._server_socket = s
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                #Allows quick restart after closing
+                s.bind((self.host, self.port))
+                s.listen(5)
+                s.settimeout(1.0)
+                #Periodic wake-up to check _running
+
+                self.log.emit(f"[Receiver] Listening on {self.host}:{self.port}")
+                self.log.emit(f"[Receiver] Saving incoming files to: {inbox.resolve()}")
+
+                while self._running:
+                    try:
+                        conn, addr = s.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                        #Socket closed by stop()
+
+                    with conn:
+                        try:
+                            self.log.emit(f"[Receiver] Connection from {addr}")
+
+                            name_len = struct.unpack("!I", recv_exact(conn, 4))[0]
+                            #Filename length header
+                            filename = recv_exact(conn, name_len).decode("utf-8")
+                            #Filename payload
+                            file_size = struct.unpack("!Q", recv_exact(conn, 8))[0]
+                            #File size header
+
+                            if not filename.lower().endswith(".ply"):
+                                self.log.emit(f"[Receiver] Rejected non-.ply file: {filename}")
+                                continue
+                                #Hard-filter to only accept .ply
+
+                            safe_name = os.path.basename(filename)
+                            #Drops any directory paths from sender
+                            out_path = inbox / safe_name
+                            base = out_path.stem
+                            suffix = out_path.suffix
+                            i = 1
+                            while out_path.exists():
+                                out_path = inbox / f"{base}_{i}{suffix}"
+                                i += 1
+                                #De-dupe collisions in inbox
+
+                            self.log.emit(f"[Receiver] Receiving: {safe_name} ({file_size} bytes)")
+                            received = 0
+                            with open(out_path, "wb") as f:
+                                while received < file_size:
+                                    chunk = conn.recv(min(65536, file_size - received))
+                                    if not chunk:
+                                        raise ConnectionError("Connection closed mid-transfer")
+                                    f.write(chunk)
+                                    received += len(chunk)
+                                    #Stream file bytes to disk
+
+                            self.log.emit(f"[Receiver] Saved {received} bytes -> {out_path}")
+                            self.file_received.emit(str(out_path))
+                            #Notifies UI to add file to queue
+
+                        except Exception as e:
+                            self.error.emit(f"[Receiver] Error: {e}")
+
+        except Exception as e:
+            self.error.emit(f"[Receiver] Fatal server error: {e}")
+
 
 class SimplePLYViewport(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        # Layout so the viewport fills the available space
         layout = QVBoxLayout(self)
+        #Fill the widget with the 3D view
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # OpenGL 3D view widget (handles mouse interaction automatically)
         self.view = gl.GLViewWidget()
-        self.view.setCameraPosition(distance=30)  # camera distance from scene
+        self.view.setCameraPosition(distance=30)
+        #Default camera distance
         layout.addWidget(self.view)
 
-        # Scatter plot item IS the point cloud renderer
         self.points = gl.GLScatterPlotItem()
+        #Point cloud renderer
         self.view.addItem(self.points)
 
-    # ✅ IMPORTANT: load_ply must be aligned with __init__ (same indentation level)
     def load_ply(self, path: str):
-        # Read the PLY file
         ply = PlyData.read(path)
+        #Parse .ply file into structured data
 
-        # Access vertex data
         vertices = ply["vertex"].data
+        #Vertex table inside the .ply
 
-        # Extract XYZ positions into (N,3) array
         pos = np.vstack((
             vertices["x"],
             vertices["y"],
             vertices["z"]
         )).T.astype(np.float32)
+        #Build Nx3 float array for XYZ
 
-        # If the PLY contains RGB, use it
         if all(name in vertices.dtype.names for name in ("red", "green", "blue")):
             rgb = np.vstack((
                 vertices["red"],
@@ -89,61 +215,79 @@ class SimplePLYViewport(QWidget):
                 vertices["blue"]
             )).T.astype(np.float32)
 
-            # Normalize colors if stored as 0–255
             if rgb.max() > 1.0:
                 rgb /= 255.0
+                #Normalize 0-255 to 0-1
 
-            # Add alpha channel (RGBA)
             color = np.hstack((
                 rgb,
                 np.ones((rgb.shape[0], 1), dtype=np.float32)
             ))
+            #Add alpha channel (RGBA)
         else:
-            # Default color if no RGB exists
             color = (1, 1, 1, 1)
+            #Fallback color if no RGB
 
-        # Send point data to OpenGL
         self.points.setData(pos=pos, color=color, size=2)
+        #Push data into OpenGL renderer
+
 
 class LidarWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # Window title shown in OS title bar
         self.setWindowTitle("LIDAR Image Generation & Stitching")
-
-        # Initial window position (x, y) and size (width, height)
         self.setGeometry(250, 250, 1100, 650)
 
-        # Build all UI widgets and layouts
         self._build_ui()
-
-        # Wire only essential signals to avoid breaking anything
         self._wire_min_signals()
 
-        # Initial log message
-        self._log("UI initialized. Ready.")
+        self._start_receiver()
+        #Start TCP receiver while UI is open
 
-        # UI Construction
+        self._log("UI initialized. Receiver is running.")
+
+    def _start_receiver(self):
+        self.receiver = ReceiverWorker(RECV_HOST, RECV_PORT, INBOX_DIR, parent=self)
+        self.receiver.log.connect(self._log)
+        self.receiver.error.connect(self._log)
+        self.receiver.file_received.connect(self._on_file_received)
+        self.receiver.start()
+
+    def _on_file_received(self, saved_path: str):
+        filename = os.path.basename(saved_path)
+
+        item = QListWidgetItem(filename)
+        item.setData(Qt.ItemDataRole.UserRole, saved_path)
+        #Store full path on the list item
+        self.scan_list.addItem(item)
+
+        self._log(f"Received -> Desktop/LiDAR_Inbox: {filename}")
+
+        if self.auto_load_chk.isChecked():
+            #Optional auto-preview of newest file
+            try:
+                self.viewport3d.load_ply(saved_path)
+                self.info_lbl.setText(f"Loaded file:\n{filename}")
+                self._log("Auto-loaded newest received file into 3D viewport.")
+            except Exception as e:
+                self._log(f"Auto-load failed: {e}")
+
     def _build_ui(self):
-        # Root widget is required to apply layouts inside QMainWindow
         root = QWidget()
         self.setCentralWidget(root)
 
-        # Main layout splits window into 3 vertical sections
         main_layout = QHBoxLayout(root)
+        #3-column layout (left|center|right)
 
-        # LEFT PANEL — Scan Queue + Import Controls
         left = QVBoxLayout()
-        main_layout.addLayout(left, 1)  # smaller width than center
+        main_layout.addLayout(left, 1)
 
         left.addWidget(QLabel("Scans Queue"))
 
-        # List widget showing imported scan filenames
         self.scan_list = QListWidget()
         left.addWidget(self.scan_list, 1)
 
-        # Row for import/delete buttons
         file_btn_row = QHBoxLayout()
         self.btn_import_local = QPushButton("Import Local")
         self.btn_delete = QPushButton("Delete Selected")
@@ -151,24 +295,19 @@ class LidarWindow(QMainWindow):
         file_btn_row.addWidget(self.btn_delete)
         left.addLayout(file_btn_row)
 
-        # Auto-load toggle (used later to auto-preview files)
-        self.auto_load_chk = QCheckBox("Auto-load newest file after import")
+        self.auto_load_chk = QCheckBox("Auto-load newest file after import/receive")
         self.auto_load_chk.setChecked(True)
         left.addWidget(self.auto_load_chk)
 
-        # CENTER PANEL — Viewport Placeholder
         center = QVBoxLayout()
-        main_layout.addLayout(center, 3)  # Center column
-        
-        # REAL 3D viewport replaces the QLabel
+        main_layout.addLayout(center, 3)
+
         self.viewport3d = SimplePLYViewport()
         center.addWidget(self.viewport3d, 1)
-        
-        # RIGHT PANEL — Controls, Info, Status
+
         right = QVBoxLayout()
         main_layout.addLayout(right, 1)
 
-        # Render Controls
         render_group = QGroupBox("Render Controls")
         render_layout = QVBoxLayout(render_group)
 
@@ -197,7 +336,6 @@ class LidarWindow(QMainWindow):
 
         right.addWidget(render_group)
 
-        # View Controls
         view_group = QGroupBox("View Controls")
         view_layout = QVBoxLayout(view_group)
 
@@ -208,7 +346,6 @@ class LidarWindow(QMainWindow):
         view_layout.addWidget(self.btn_reset)
         right.addWidget(view_group)
 
-        # File Info
         info_group = QGroupBox("File Info")
         info_layout = QVBoxLayout(info_group)
 
@@ -218,7 +355,6 @@ class LidarWindow(QMainWindow):
 
         right.addWidget(info_group)
 
-        # Progress + Log
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -232,30 +368,24 @@ class LidarWindow(QMainWindow):
         self.log_lbl.setMinimumHeight(140)
         self.log_lbl.setStyleSheet("border: 1px solid #999; padding: 8px;")
         right.addWidget(self.log_lbl, 1)
-        
-        # Precheck dark mode box
+
         self._apply_dark_theme(self.chk_dark_bg.isChecked())
 
-
-    # Minimal Signal Wiring
     def _wire_min_signals(self):
-        # Only two connected actions for now:
         self.btn_import_local.clicked.connect(self._import_local_clicked)
         self.btn_delete.clicked.connect(self._delete_selected_clicked)
-        # Wire dark theme toggle (checkbox emits bool)
+
+        self.scan_list.itemDoubleClicked.connect(self._load_item_into_viewport)
+        #Double-click loads selected scan
+
         try:
             self.chk_dark_bg.toggled.connect(self._apply_dark_theme)
         except Exception:
-            # In case UI construction hasn't created the checkbox yet
             pass
 
-        # Apply initial theme based on the checkbox state
-        if hasattr(self, 'chk_dark_bg'):
-            self._apply_dark_theme(self.chk_dark_bg.isChecked())
+        self._apply_dark_theme(self.chk_dark_bg.isChecked())
 
-    # Import Local — REAL File Picker
     def _import_local_clicked(self):
-        # 1) Open file picker FIRST
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Select LiDAR Scan(s)",
@@ -263,64 +393,80 @@ class LidarWindow(QMainWindow):
             "PLY Files (*.ply);;All Files (*)"
         )
 
-        # 2) If canceled, stop
         if not file_paths:
             self._log("Import canceled.")
             return
 
-        # 3) Add filenames to the list
         for path in file_paths:
-            filename = path.split("/")[-1]
-            self.scan_list.addItem(filename)
+            filename = os.path.basename(path)
+            item = QListWidgetItem(filename)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            #Store full path on the list item
+            self.scan_list.addItem(item)
             self._log(f"Imported local file: {filename}")
 
-        # 4) Auto-load newest (last selected)
         if self.auto_load_chk.isChecked():
             newest_path = file_paths[-1]
-            self.viewport3d.load_ply(newest_path)
-            self.info_lbl.setText(f"Loaded file:\n{newest_path.split('/')[-1]}")
-            self._log("Loaded newest imported file into 3D viewport.")
+            #Loads the most recently selected file
+            try:
+                self.viewport3d.load_ply(newest_path)
+                self.info_lbl.setText(f"Loaded file:\n{os.path.basename(newest_path)}")
+                self._log("Loaded newest imported file into 3D viewport.")
+            except Exception as e:
+                self._log(f"Load failed: {e}")
+
+    def _load_item_into_viewport(self, item: QListWidgetItem):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        #Pull stored path from list item
+        if not path or not os.path.exists(path):
+            self._log("Selected item has no valid file path (missing file?).")
+            return
+
+        try:
+            self.viewport3d.load_ply(path)
+            self.info_lbl.setText(f"Loaded file:\n{os.path.basename(path)}")
+            self._log(f"Loaded from queue: {os.path.basename(path)}")
+        except Exception as e:
+            self._log(f"Load failed: {e}")
 
     def _delete_selected_clicked(self):
-        # Remove each selected item from the scan queue
         for item in self.scan_list.selectedItems():
             row = self.scan_list.row(item)
             self.scan_list.takeItem(row)
+        #Removes from UI queue only
 
         self._log("Deleted selected scan(s) from queue.")
 
-        # Next steps if we think necessary:
-        # If full paths are stored in item data,
-        # deletion will automatically stay in sync.
-
-    # Simple Logger Utility
     def _log(self, msg: str):
         from time import strftime
         ts = strftime("%H:%M:%S")
-
         current = self.log_lbl.text()
         self.log_lbl.setText((f"[{ts}] {msg}\n" + current)[:4000])
+        #Keeps log bounded to avoid UI slowdown
 
-    # Theme application handler
     def _apply_dark_theme(self, enabled: bool):
         app = QApplication.instance()
         if not app:
             return
-        if enabled:
-            app.setStyleSheet(DARK_STYLESHEET)
-        else:
-            app.setStyleSheet("")
+        app.setStyleSheet(DARK_STYLESHEET if enabled else "")
+        #Applies global stylesheet to the app
+
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "receiver") and self.receiver.isRunning():
+                self._log("Stopping receiver...")
+                self.receiver.stop()
+                self.receiver.wait(1500)
+                #Stops thread before closing UI
+        except Exception:
+            pass
+        super().closeEvent(event)
+
 
 def main():
-    # Create Qt application
     lidar_app = QApplication(sys.argv)
-    # Note: Theme is applied by the window's `Dark background` checkbox.
-
-    # Create and show main window
     lidar_main = LidarWindow()
     lidar_main.show()
-
-    # Start event loop
     sys.exit(lidar_app.exec())
 
 
