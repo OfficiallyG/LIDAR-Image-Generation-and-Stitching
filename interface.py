@@ -42,17 +42,17 @@ def get_desktop_path() -> Path:
 
 
 INBOX_DIR = get_desktop_path() / "LiDAR_Inbox"
-#Incoming .ply files land here
+#Receiver saves incoming .ply files here
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
-#Auto-create inbox folder if missing
+#Create inbox once on startup
 RECV_HOST = "0.0.0.0"
-#Listen on all network interfaces
+#Bind on all NICs so LAN devices can connect
 RECV_PORT = 5001
 #Must match sender port
 
 
 def recv_exact(conn: socket.socket, n: int) -> bytes:
-    #Reads exactly n bytes or raises if the connection closes.
+    #Reliable fixed-length read for framed protocol
     data = b""
     while len(data) < n:
         chunk = conn.recv(n - len(data))
@@ -64,11 +64,11 @@ def recv_exact(conn: socket.socket, n: int) -> bytes:
 
 class ReceiverWorker(QThread):
     file_received = pyqtSignal(str)
-    #Emits saved file path for UI updates
+    #Pushes saved file path to UI thread
     log = pyqtSignal(str)
-    #Emits status messages
+    #Thread-safe logging to UI
     error = pyqtSignal(str)
-    #Emits error messages
+    #Thread-safe error reporting
 
     def __init__(self, host: str, port: int, inbox_dir: Path, parent=None):
         super().__init__(parent)
@@ -76,34 +76,34 @@ class ReceiverWorker(QThread):
         self.port = port
         self.inbox_dir = inbox_dir
         self._running = True
-        #Loop control flag
+        #Stop flag checked by accept loop
         self._server_socket: Optional[socket.socket] = None
-        #Used to interrupt accept() on stop
+        #Closed to break accept() during stop
 
     def stop(self):
         self._running = False
-        #Signals thread loop to exit
+        #Request thread shutdown
         try:
             if self._server_socket:
                 self._server_socket.close()
-                #Forces accept() to break quickly
+                #Force accept() to exit quickly
         except Exception:
             pass
 
     def run(self):
         inbox = self.inbox_dir
         inbox.mkdir(parents=True, exist_ok=True)
-        #Ensure inbox exists before receiving
+        #Ensure target folder exists before bind
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 self._server_socket = s
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                #Allows quick restart after closing
+                #Avoid "address already in use" on quick restarts
                 s.bind((self.host, self.port))
                 s.listen(5)
                 s.settimeout(1.0)
-                #Periodic wake-up to check _running
+                #Wake periodically to check _running
 
                 self.log.emit(f"[Receiver] Listening on {self.host}:{self.port}")
                 self.log.emit(f"[Receiver] Saving incoming files to: {inbox.resolve()}")
@@ -115,26 +115,26 @@ class ReceiverWorker(QThread):
                         continue
                     except OSError:
                         break
-                        #Socket closed by stop()
+                        #Socket likely closed by stop()
 
                     with conn:
                         try:
                             self.log.emit(f"[Receiver] Connection from {addr}")
 
                             name_len = struct.unpack("!I", recv_exact(conn, 4))[0]
-                            #Filename length header
+                            #Read filename length (4 bytes)
                             filename = recv_exact(conn, name_len).decode("utf-8")
-                            #Filename payload
+                            #Read filename bytes
                             file_size = struct.unpack("!Q", recv_exact(conn, 8))[0]
-                            #File size header
+                            #Read file size (8 bytes)
 
                             if not filename.lower().endswith(".ply"):
                                 self.log.emit(f"[Receiver] Rejected non-.ply file: {filename}")
                                 continue
-                                #Hard-filter to only accept .ply
+                                #Only accept expected file type
 
                             safe_name = os.path.basename(filename)
-                            #Drops any directory paths from sender
+                            #Strip any sender-side directories
                             out_path = inbox / safe_name
                             base = out_path.stem
                             suffix = out_path.suffix
@@ -142,7 +142,7 @@ class ReceiverWorker(QThread):
                             while out_path.exists():
                                 out_path = inbox / f"{base}_{i}{suffix}"
                                 i += 1
-                                #De-dupe collisions in inbox
+                                #De-dupe if same name already exists
 
                             self.log.emit(f"[Receiver] Receiving: {safe_name} ({file_size} bytes)")
                             received = 0
@@ -153,11 +153,11 @@ class ReceiverWorker(QThread):
                                         raise ConnectionError("Connection closed mid-transfer")
                                     f.write(chunk)
                                     received += len(chunk)
-                                    #Stream file bytes to disk
+                                    #Stream bytes until expected length reached
 
                             self.log.emit(f"[Receiver] Saved {received} bytes -> {out_path}")
                             self.file_received.emit(str(out_path))
-                            #Notifies UI to add file to queue
+                            #Notify UI that a new file is ready
 
                         except Exception as e:
                             self.error.emit(f"[Receiver] Error: {e}")
@@ -167,6 +167,7 @@ class ReceiverWorker(QThread):
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:
+    #Safe unit-vector helper for camera math
     n = float(np.linalg.norm(v))
     if n < 1e-9:
         return v
@@ -180,72 +181,81 @@ class SlotGLView(gl.GLViewWidget):
     def __init__(self, get_selected_center_fn, pick_slot_from_world_fn, parent=None):
         super().__init__(parent)
         self._get_selected_center_fn = get_selected_center_fn
+        #Provides current selection center for zoom targeting
         self._pick_slot_from_world_fn = pick_slot_from_world_fn
-        #Leave default mouse behavior enabled so orbit/pan works
+        #Maps world hit point to a slot index
 
     def _raycast_to_plane_z0(self, x_px: float, y_px: float) -> Optional[Tuple[float, float, float]]:
-        #Ray from camera through pixel, intersect plane z=0
+        #Convert screen pixel to world hit on z=0 plane
         w = max(1, self.width())
         h = max(1, self.height())
         aspect = w / h
+        #Aspect affects horizontal FOV scaling
 
-        #NDC [-1..1]
         x_ndc = (2.0 * (x_px / w)) - 1.0
         y_ndc = 1.0 - (2.0 * (y_px / h))
+        #Normalize pixel to [-1..1] clip space
 
-        #Camera opts from GLViewWidget
         dist = float(self.opts.get("distance", 50.0))
         elev = float(self.opts.get("elevation", 0.0))
         azim = float(self.opts.get("azimuth", 0.0))
         fov = float(self.opts.get("fov", 60.0))
         center = self.opts.get("center", Vector(0, 0, 0))
         cx, cy, cz = float(center.x()), float(center.y()), float(center.z())
+        #Use GLViewWidget camera parameters (no matrices)
 
-        #Camera position in world (spherical)
         el = np.deg2rad(elev)
         az = np.deg2rad(azim)
+        #Degrees -> radians
 
         cam_pos = np.array([
             cx + dist * np.cos(el) * np.cos(az),
             cy + dist * np.cos(el) * np.sin(az),
             cz + dist * np.sin(el),
         ], dtype=np.float64)
+        #Camera position around center (spherical)
 
         target = np.array([cx, cy, cz], dtype=np.float64)
+        #Camera looks toward center
 
         forward = _normalize(target - cam_pos)
         up_world = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        #World up axis for basis build
 
         right = _normalize(np.cross(forward, up_world))
-        #If forward is nearly parallel to up, fall back
+        #Right vector from forward and world up
         if float(np.linalg.norm(right)) < 1e-6:
             up_world = np.array([0.0, 1.0, 0.0], dtype=np.float64)
             right = _normalize(np.cross(forward, up_world))
+            #Fallback if forward ~ parallel to up
 
         up = _normalize(np.cross(right, forward))
+        #Orthogonal up vector in camera basis
 
-        #Camera-space direction through considering fov
         tan_half = np.tan(np.deg2rad(fov) / 2.0)
         dx = x_ndc * aspect * tan_half
         dy = y_ndc * tan_half
+        #Project NDC into camera ray direction
 
-        #Ray direction in world
         ray_dir = _normalize((right * dx) + (up * dy) + (forward * 1.0))
+        #World-space ray direction
 
-        #Intersect z=0 plane: cam_pos.z + t*dir.z = 0
         dz = ray_dir[2]
         if abs(dz) < 1e-9:
             return None
+            #No intersection if ray is parallel to plane
 
         t = -cam_pos[2] / dz
         if t < 0.0:
             return None
+            #Ignore hits behind camera
 
         hit = cam_pos + t * ray_dir
         return (float(hit[0]), float(hit[1]), 0.0)
+        #Return world point on z=0 plane
 
     def mouseDoubleClickEvent(self, ev):
-        #Select slot ONLY on double click (raycast -> plane -> cube footprint test)
+        #Double-click performs slot picking without breaking orbit controls
         if ev.button() == Qt.MouseButton.LeftButton:
             pos = ev.position()
             hit = self._raycast_to_plane_z0(pos.x(), pos.y())
@@ -258,11 +268,12 @@ class SlotGLView(gl.GLViewWidget):
         super().mouseDoubleClickEvent(ev)
 
     def wheelEvent(self, ev):
-        #Before zoom, center camera on selected cube if one is selected
+        #Zoom toward selected slot by shifting camera center
         try:
             center = self._get_selected_center_fn()
             if center is not None:
                 self.opts["center"] = Vector(center[0], center[1], center[2])
+                #Make scroll zoom focus on selected cube
         except Exception:
             pass
         super().wheelEvent(ev)
@@ -275,17 +286,24 @@ class MultiSlotPLYViewport(QWidget):
         super().__init__(parent)
 
         self.max_slots = 9
+        #3x3 grid capacity
         self.cube_size = 22.0
+        #Visual bounding box size per slot
         self.slot_spacing = self.cube_size
+        #Grid spacing matches cube size
 
         self.slot_centers = self._build_slot_centers()
+        #Precompute cube centers in world space
 
         self.slot_points: List[gl.GLScatterPlotItem] = []
         self.slot_cubes: List[gl.GLLinePlotItem] = []
         self.slot_cube_base_pts: List[np.ndarray] = []
+        #Per-slot render objects + cached cube geometry
 
         self.slot_filled: List[bool] = [False] * self.max_slots
+        #Tracks which slots contain data
         self.selected_slot: Optional[int] = None
+        #Current selected slot index
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -294,19 +312,25 @@ class MultiSlotPLYViewport(QWidget):
             self.get_selected_center,
             self._pick_slot_from_world_xy
         )
+        #Custom GL view with picking support
         self.view.setCameraPosition(distance=85, elevation=18, azimuth=45)
         self.view.opts["center"] = Vector(0, 0, 0)
+        #Default camera framing for 3x3 grid
 
         try:
             self.view.setBackgroundColor("w")
         except Exception:
             self.view.opts["bgcolor"] = (255, 255, 255, 255)
+            #Fallback if setBackgroundColor not available
 
         layout.addWidget(self.view)
 
         self._build_slots()
+        #Create empty slot renderers
         self.view.slot_double_clicked.connect(self.select_slot)
+        #Connect pick event to selection logic
         self._refresh_cube_highlights()
+        #Apply initial highlight state
 
     def _build_slot_centers(self) -> List[Tuple[float, float, float]]:
         centers = []
@@ -316,26 +340,29 @@ class MultiSlotPLYViewport(QWidget):
                 y = (1 - r) * self.slot_spacing
                 centers.append((x, y, 0.0))
         return centers
+        #Centers laid out as 3x3 grid on z=0
 
     def get_selected_center(self) -> Optional[Tuple[float, float, float]]:
         if self.selected_slot is None:
             return None
         return self.slot_centers[self.selected_slot]
+        #Provides selected cube center for zoom targeting
 
     def _pick_slot_from_world_xy(self, x: float, y: float) -> Optional[int]:
-        #Pick the nearest cube center, then require the click be INSIDE that cube footprint
+        #Nearest-center pick with footprint containment check
         centers_xy = np.array([(cx, cy) for (cx, cy, _) in self.slot_centers], dtype=np.float64)
         p = np.array([x, y], dtype=np.float64)
 
         d2 = np.sum((centers_xy - p) ** 2, axis=1)
         idx = int(np.argmin(d2))
+        #Choose closest cube center
 
         cx, cy, _ = self.slot_centers[idx]
         half = float(self.cube_size) / 2.0
 
-        #Only select if hit is inside the cube footprint
         if abs(x - cx) <= half and abs(y - cy) <= half:
             return idx
+            #Only accept click inside cube footprint
         return None
 
     def _cube_edges(self, size: float) -> List[Tuple[np.ndarray, np.ndarray]]:
@@ -354,11 +381,13 @@ class MultiSlotPLYViewport(QWidget):
             (p100, p101), (p101, p111), (p111, p110), (p110, p100),
             (p000, p100), (p001, p101), (p011, p111), (p010, p110),
         ]
+        #12 cube edges as endpoint pairs
 
     def _wire_cube_dotted(self, size: float, dash_count: int = 18) -> np.ndarray:
         pts = []
         edges = self._cube_edges(size)
         n = max(6, dash_count)
+        #Ensure enough dashes to look dotted
 
         for a, b in edges:
             for i in range(n):
@@ -369,8 +398,10 @@ class MultiSlotPLYViewport(QWidget):
                     p1 = a * (1.0 - t1) + b * t1
                     pts.append(p0)
                     pts.append(p1)
+                    #Alternate segments to create dash gaps
 
         return np.vstack(pts).astype(np.float32)
+        #Line segments formatted for GLLinePlotItem
 
     def _build_slots(self):
         for _ in range(self.max_slots):
@@ -378,12 +409,14 @@ class MultiSlotPLYViewport(QWidget):
             scatter.setGLOptions("opaque")
             self.view.addItem(scatter)
             self.slot_points.append(scatter)
+            #One scatter renderer per slot
 
         for i in range(self.max_slots):
             cx, cy, cz = self.slot_centers[i]
             base = self._wire_cube_dotted(self.cube_size, dash_count=18)
             base = base + np.array([cx, cy, cz], dtype=np.float32)
             self.slot_cube_base_pts.append(base)
+            #Cache cube geometry per slot
 
             cube = gl.GLLinePlotItem(
                 pos=base,
@@ -394,6 +427,7 @@ class MultiSlotPLYViewport(QWidget):
             cube.setGLOptions("translucent")
             self.view.addItem(cube)
             self.slot_cubes.append(cube)
+            #Dotted cube outline for each slot
 
     def _refresh_cube_highlights(self):
         for i in range(self.max_slots):
@@ -403,38 +437,47 @@ class MultiSlotPLYViewport(QWidget):
                     color=(0.25, 0.25, 0.25, 0.70),
                     width=3
                 )
+                #Selected cube appears darker/thicker
             else:
                 self.slot_cubes[i].setData(
                     pos=self.slot_cube_base_pts[i],
                     color=(0.40, 0.40, 0.40, 0.45),
                     width=2
                 )
+                #Unselected cubes use default style
 
         sel = self.get_selected_center()
         if sel is not None:
             self.view.opts["center"] = Vector(sel[0], sel[1], sel[2])
+            #Keep camera centered on selection
 
     def select_slot(self, slot_index: int):
         if slot_index < 0 or slot_index >= self.max_slots:
             return
+            #Ignore invalid index
         self.selected_slot = slot_index
         self._refresh_cube_highlights()
         self.slot_selected.emit(slot_index)
+        #Broadcast selection to rest of UI
 
     def clear_slots(self):
         for i in range(self.max_slots):
             self.slot_points[i].setData(pos=np.zeros((0, 3), dtype=np.float32))
             self.slot_filled[i] = False
+            #Clear points and mark empty
         self.selected_slot = None
         self._refresh_cube_highlights()
+        #Reset selection visuals
 
     def next_empty_slot(self) -> Optional[int]:
         for i in range(self.max_slots):
             if not self.slot_filled[i]:
                 return i
+                #First available slot
         return None
 
     def _robust_normalize(self, z: np.ndarray) -> np.ndarray:
+        #Percentile-based normalization to reduce outlier impact
         if z.size == 0:
             return z
         lo = float(np.percentile(z, 2))
@@ -444,10 +487,12 @@ class MultiSlotPLYViewport(QWidget):
             hi = float(z.max())
             if (hi - lo) < 1e-6:
                 return np.zeros_like(z, dtype=np.float32)
+                #All heights identical -> flat colors
         t = (z - lo) / (hi - lo)
         return np.clip(t, 0.0, 1.0).astype(np.float32)
 
     def _height_colors_smooth(self, t: np.ndarray) -> np.ndarray:
+        #Smooth gradient mapping from normalized height -> RGBA
         anchors = np.array([
             [1.00, 0.92, 0.10],  #yellow
             [1.00, 0.55, 0.10],  #orange
@@ -456,6 +501,7 @@ class MultiSlotPLYViewport(QWidget):
             [0.60, 0.25, 0.85],  #purple
             [0.15, 0.80, 0.30],  #green
         ], dtype=np.float32)
+        #Color stops for interpolation
 
         t = np.clip(t, 0.0, 1.0)
         nseg = anchors.shape[0] - 1
@@ -463,15 +509,19 @@ class MultiSlotPLYViewport(QWidget):
         i0 = np.floor(u).astype(np.int32)
         i0 = np.clip(i0, 0, nseg - 1)
         f = (u - i0).astype(np.float32)
+        #Segment index + within-segment fraction
 
         c0 = anchors[i0]
         c1 = anchors[i0 + 1]
         rgb = (1.0 - f[:, None]) * c0 + f[:, None] * c1
+        #Linear interpolation per point
         return np.hstack((rgb, np.ones((rgb.shape[0], 1), dtype=np.float32)))
+        #Add alpha=1 for GLScatterPlotItem
 
     def load_ply_into_slot(self, path: str, slot_index: int):
         if slot_index < 0 or slot_index >= self.max_slots:
             raise ValueError("slot_index out of range (0..8)")
+            #Guard against bad slot index
 
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             header_lines = 0
@@ -479,30 +529,41 @@ class MultiSlotPLYViewport(QWidget):
                 header_lines += 1
                 if line.strip() == "end_header":
                     break
+            #Count header to skip into numeric section
 
         data = np.loadtxt(path, skiprows=header_lines, dtype=np.float32)
+        #Loads ASCII PLY numeric body
         if data.ndim == 1:
             data = data.reshape(1, -1)
+            #Ensure 2D for single-point files
         if data.shape[1] < 3:
             raise ValueError("PLY does not contain x y z columns")
+            #Requires at least XYZ columns
 
         pos = data[:, :3].astype(np.float32)
+        #Extract XYZ only
 
         mins = pos.min(axis=0)
         maxs = pos.max(axis=0)
         center = (mins + maxs) / 2.0
         span = (maxs - mins)
+        #Bounding-box fit inputs
         max_span = float(np.max(span)) if float(np.max(span)) > 0 else 1.0
+        #Avoid divide by zero
 
         fit_scale = (self.cube_size * 0.90) / max_span
+        #Scale to fit inside cube with margin
         pos_local = (pos - center) * fit_scale
+        #Center + scale around origin
 
         cx, cy, cz = self.slot_centers[slot_index]
         pos_world = pos_local + np.array([cx, cy, cz], dtype=np.float32)
+        #Place centered cloud into chosen slot
 
         z = pos_local[:, 2]
         t = self._robust_normalize(z)
         color = self._height_colors_smooth(t)
+        #Height-based coloring in local coordinates
 
         self.slot_points[slot_index].setData(
             pos=pos_world.astype(np.float32),
@@ -510,8 +571,10 @@ class MultiSlotPLYViewport(QWidget):
             size=3.5,
             pxMode=True
         )
+        #Upload point cloud to GPU renderer
         self.slot_points[slot_index].setGLOptions("opaque")
         self.slot_filled[slot_index] = True
+        #Mark slot as occupied
 
 
 class LidarWindow(QMainWindow):
@@ -522,6 +585,7 @@ class LidarWindow(QMainWindow):
         self.setGeometry(250, 250, 1100, 650)
 
         self._closing = False
+        #Used to avoid extra work during shutdown
 
         self._build_ui()
         self._wire_min_signals()
@@ -536,39 +600,49 @@ class LidarWindow(QMainWindow):
         self.receiver.file_received.connect(self._on_file_received)
         self.receiver.finished.connect(self._on_receiver_finished)
         self.receiver.start()
+        #Run TCP receiver in background thread
 
     def _on_receiver_error(self, msg: str):
         self._log(msg)
+        #Surface receiver errors in UI log
 
     def _on_receiver_finished(self):
         self._log("[Receiver] Receiver thread finished.")
+        #Lets user know receiver stopped
 
     def _on_slot_selected(self, slot_index: int):
         self._log(f"Selected slot: {slot_index + 1}")
         self.info_lbl.setText(f"Selected slot {slot_index + 1} (load a file here)")
         self.selected_slot_lbl.setText(f"Selected Slot: {slot_index + 1}")
+        #UI state sync when selection changes
 
     def _choose_target_slot(self) -> Optional[int]:
         lock = self.lock_selection_chk.isChecked()
+        #If locked, always load into selected slot
 
         if self.viewport3d.selected_slot is None:
             return self.viewport3d.next_empty_slot()
+            #No selection -> pick next empty
 
         s = self.viewport3d.selected_slot
         if lock:
             return s
         if not self.viewport3d.slot_filled[s]:
             return s
+            #Selected slot empty -> use it
         return self.viewport3d.next_empty_slot()
+        #Selected slot full -> fallback to next empty
 
     def _post_load_selection_update(self, used_slot: int):
         if self.lock_selection_chk.isChecked():
             return
+            #Keep selection fixed when locked
         if self.viewport3d.selected_slot is not None and self.viewport3d.selected_slot == used_slot:
             nxt = self.viewport3d.next_empty_slot()
             if nxt is None:
                 return
             self.viewport3d.select_slot(nxt)
+            #Auto-advance selection after filling a slot
 
     def _load_path_into_target_slot(self, path: str):
         slot = self._choose_target_slot()
@@ -583,6 +657,7 @@ class LidarWindow(QMainWindow):
             self.info_lbl.setText(f"Loaded into slot {slot + 1}:\n{os.path.basename(path)}")
             self.selected_slot_lbl.setText(f"Selected Slot: {slot + 1}")
             self._post_load_selection_update(slot)
+            #Keep UI labels + selection consistent
 
         except Exception as e:
             self._log(f"Load failed: {e}")
@@ -593,11 +668,13 @@ class LidarWindow(QMainWindow):
         item = QListWidgetItem(filename)
         item.setData(Qt.ItemDataRole.UserRole, saved_path)
         self.scan_list.addItem(item)
+        #Queue received file in UI list
 
         self._log(f"Received -> Desktop/LiDAR_Inbox: {filename}")
 
         if self.auto_load_chk.isChecked():
             self._load_path_into_target_slot(saved_path)
+            #Auto-load newest receive into a slot
 
     def _build_ui(self):
         root = QWidget()
@@ -633,6 +710,7 @@ class LidarWindow(QMainWindow):
         hint = QLabel("Double-click INSIDE a cube footprint to select it. Drag to orbit. Mouse wheel zooms toward selected cube.")
         hint.setWordWrap(True)
         center.addWidget(hint)
+        #User instruction for selection + navigation
 
         right = QVBoxLayout()
         main_layout.addLayout(right, 1)
@@ -681,12 +759,14 @@ class LidarWindow(QMainWindow):
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_target_slot)
         self.btn_clear_slots.clicked.connect(self._clear_slots_clicked)
         self.viewport3d.slot_selected.connect(self._on_slot_selected)
+        #Minimal UI wiring for queue + slot selection
 
     def _clear_slots_clicked(self):
         self.viewport3d.clear_slots()
         self.info_lbl.setText("Cleared all 3D slots.")
         self.selected_slot_lbl.setText("Selected Slot: None")
         self._log("Cleared all 3D slots.")
+        #Reset UI state after clearing
 
     def _import_local_clicked(self):
         file_paths, _ = QFileDialog.getOpenFileNames(
@@ -706,10 +786,12 @@ class LidarWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, path)
             self.scan_list.addItem(item)
             self._log(f"Imported local file: {filename}")
+            #Queue imports for later load
 
         if self.auto_load_chk.isChecked():
             for p in file_paths:
                 self._load_path_into_target_slot(p)
+                #Bulk auto-load imported scans
 
     def _load_item_into_target_slot(self, item: QListWidgetItem):
         path = item.data(Qt.ItemDataRole.UserRole)
@@ -717,11 +799,13 @@ class LidarWindow(QMainWindow):
             self._log("Selected item has no valid file path (missing file?).")
             return
         self._load_path_into_target_slot(path)
+        #Load chosen queued scan into viewer
 
     def _delete_selected_clicked(self):
         for item in self.scan_list.selectedItems():
             row = self.scan_list.row(item)
             self.scan_list.takeItem(row)
+            #Removes from UI list only
         self._log("Deleted selected scan(s) from queue.")
 
     def _log(self, msg: str):
@@ -729,14 +813,17 @@ class LidarWindow(QMainWindow):
         ts = strftime("%H:%M:%S")
         current = self.log_lbl.text()
         self.log_lbl.setText((f"[{ts}] {msg}\n" + current)[:4000])
+        #Prepend newest log and cap size
 
     def closeEvent(self, event):
         self._closing = True
+        #Signals shutdown path
         try:
             if hasattr(self, "receiver") and self.receiver.isRunning():
                 self._log("Stopping receiver...")
                 self.receiver.stop()
                 self.receiver.wait(1500)
+                #Stop thread before window closes
         except Exception:
             pass
         super().closeEvent(event)
@@ -751,3 +838,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
