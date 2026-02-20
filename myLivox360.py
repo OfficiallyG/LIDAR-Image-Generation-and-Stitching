@@ -7,15 +7,22 @@ import numpy as np
 import socket
 import matplotlib.pyplot as plt
 import cv2
+import struct
 
 img_height, img_width, dist_max = 500, 500, 300 # 500x500 pixels, 300 cm max distance
 lidar_port_number = 56301
 frame_udp_count = 209
 
 def network_lidar_reader(filter_func = lambda x, y, z: True):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1) # allows shared port
     server_address = ('0.0.0.0', lidar_port_number)
     sock.bind(server_address)
+
+    #join multicast group to "hear" sdk data
+    group = socket.inet_aton("224.1.1.5")
+    mreq = struct.pack("4sL", group, socket.INADDR_ANY)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
     udp_pktnum = frame_udp_count
     ld = np.empty((udp_pktnum * 96, 4))
