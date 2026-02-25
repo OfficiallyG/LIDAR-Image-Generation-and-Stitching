@@ -41,6 +41,19 @@ def get_desktop_path() -> Path:
     #Fallback if Desktop not found
 
 
+def get_local_ip() -> str:
+    #Best-effort: finds the LAN IP used for outbound traffic (works on most networks)
+    #Does NOT send data; UDP connect is just used to learn routing interface
+    ip = "127.0.0.1"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+    except Exception:
+        pass
+    return ip
+
+
 INBOX_DIR = get_desktop_path() / "LiDAR_Inbox"
 #Receiver saves incoming .ply files here
 INBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,6 +82,8 @@ class ReceiverWorker(QThread):
     #Thread-safe logging to UI
     error = pyqtSignal(str)
     #Thread-safe error reporting
+    status = pyqtSignal(bool)
+    #True = running/listening, False = stopped/faulted
 
     def __init__(self, host: str, port: int, inbox_dir: Path, parent=None):
         super().__init__(parent)
@@ -104,6 +119,9 @@ class ReceiverWorker(QThread):
                 s.listen(5)
                 s.settimeout(1.0)
                 #Wake periodically to check _running
+
+                self.status.emit(True)
+                #Receiver successfully bound/listening
 
                 self.log.emit(f"[Receiver] Listening on {self.host}:{self.port}")
                 self.log.emit(f"[Receiver] Saving incoming files to: {inbox.resolve()}")
@@ -164,6 +182,10 @@ class ReceiverWorker(QThread):
 
         except Exception as e:
             self.error.emit(f"[Receiver] Fatal server error: {e}")
+
+        finally:
+            self.status.emit(False)
+            #Receiver stopped (normal stop or crash)
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:
@@ -593,21 +615,68 @@ class LidarWindow(QMainWindow):
         self._start_receiver()
         self._log("UI initialized. Receiver is running.")
 
+        #Refresh local IP periodically (handles Wi-Fi changes)
+        self._ip_timer = QTimer(self)
+        self._ip_timer.setInterval(2500)
+        self._ip_timer.timeout.connect(self._refresh_ip_label)
+        self._ip_timer.start()
+        self._refresh_ip_label()
+
     def _start_receiver(self):
         self.receiver = ReceiverWorker(RECV_HOST, RECV_PORT, INBOX_DIR, parent=self)
         self.receiver.log.connect(self._log)
         self.receiver.error.connect(self._on_receiver_error)
         self.receiver.file_received.connect(self._on_file_received)
         self.receiver.finished.connect(self._on_receiver_finished)
+        self.receiver.status.connect(self._on_receiver_status)
         self.receiver.start()
         #Run TCP receiver in background thread
+
+    def _on_receiver_status(self, running: bool):
+        #Green if receiver is actively listening, red if stopped/faulted
+        if running:
+            self.receiver_status_lbl.setText("Receiver: RUNNING")
+            self._set_status_dot(True)
+        else:
+            self.receiver_status_lbl.setText("Receiver: NOT RUNNING")
+            self._set_status_dot(False)
+
+    def _set_status_dot(self, running: bool):
+        #Glowing dot indicator via stylesheet
+        if running:
+            #Glowing green
+            self.receiver_dot.setStyleSheet(
+                "width: 14px; height: 14px; border-radius: 7px;"
+                "background: #28d14c;"
+                "border: 1px solid #0a7a1c;"
+                "box-shadow: 0 0 10px rgba(40, 209, 76, 0.9);"
+            )
+        else:
+            #Glowing red
+            self.receiver_dot.setStyleSheet(
+                "width: 14px; height: 14px; border-radius: 7px;"
+                "background: #e03a3a;"
+                "border: 1px solid #8a1111;"
+                "box-shadow: 0 0 10px rgba(224, 58, 58, 0.9);"
+            )
+
+    def _refresh_ip_label(self):
+        #Shows the laptop IP so the Pi operator can type it into the sender config
+        ip = get_local_ip()
+        self.ip_value_lbl.setText(f"{ip}:{RECV_PORT}")
 
     def _on_receiver_error(self, msg: str):
         self._log(msg)
         #Surface receiver errors in UI log
+        #If there is an error that stops the receiver, ensure UI reflects "not running"
+        if "Fatal" in msg:
+            self._set_status_dot(False)
+            self.receiver_status_lbl.setText("Receiver: NOT RUNNING")
 
     def _on_receiver_finished(self):
         self._log("[Receiver] Receiver thread finished.")
+        self._set_status_dot(False)
+        self.receiver_status_lbl.setText("Receiver: NOT RUNNING")
         #Lets user know receiver stopped
 
     def _on_slot_selected(self, slot_index: int):
@@ -684,6 +753,37 @@ class LidarWindow(QMainWindow):
 
         left = QVBoxLayout()
         main_layout.addLayout(left, 1)
+
+        # --- Receiver status + IP display (TOP OF LEFT COLUMN) ---
+        status_row = QHBoxLayout()
+
+        self.receiver_dot = QLabel("")
+        #Dot is styled via stylesheet to glow
+        self.receiver_dot.setFixedSize(14, 14)
+
+        self.receiver_status_lbl = QLabel("Receiver: NOT RUNNING")
+        self.receiver_status_lbl.setStyleSheet("font-weight: bold;")
+
+        status_row.addWidget(self.receiver_dot)
+        status_row.addWidget(self.receiver_status_lbl)
+        status_row.addStretch(1)
+
+        left.addLayout(status_row)
+        self._set_status_dot(False)
+        #Default to red until worker reports running
+
+        ip_row = QHBoxLayout()
+        ip_title = QLabel("Laptop IP:")
+        ip_title.setStyleSheet("font-weight: bold;")
+        self.ip_value_lbl = QLabel("0.0.0.0:----")
+        self.ip_value_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        #Selectable so you can copy/paste if needed
+        ip_row.addWidget(ip_title)
+        ip_row.addWidget(self.ip_value_lbl, 1)
+        left.addLayout(ip_row)
+
+        left.addSpacing(8)
+        # --- End status/IP section ---
 
         left.addWidget(QLabel("Scans Queue"))
 
@@ -838,4 +938,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
