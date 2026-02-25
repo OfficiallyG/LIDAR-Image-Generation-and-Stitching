@@ -1,4 +1,5 @@
-#import sys for argv and clean app exit
+#===== SECTION 1: IMPORTS START POINT =====
+# #import sys for argv and clean app exit
 import sys
 #import os for safe filename handling and file existence checks
 import os
@@ -35,8 +36,9 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QFileDialog
 )
+#===== SECTION 1: IMPORTS END POINT =====
 
-#===== PATHS AND NETWORK CONFIG START POINT =====
+#===== SECTION 2: PATHS AND NETWORK CONFIG START POINT =====
 def get_desktop_path() -> Path:
     #find a desktop path that works on common windows setups
     home = Path.home()
@@ -75,9 +77,9 @@ INBOX_DIR.mkdir(parents=True, exist_ok=True)
 RECV_HOST = "0.0.0.0"
 #must match sender port
 RECV_PORT = 5001
-#===== PATHS AND NETWORK CONFIG END POINT =====
+#===== SECTION 2: PATHS AND NETWORK CONFIG END POINT =====
 
-#===== TCP TRANSFER HELPERS START POINT =====
+#===== SECTION 3: TCP TRANSFER HELPERS START POINT =====
 def recv_exact(conn: socket.socket, n: int) -> bytes:
     #read exactly n bytes or raise if connection closes
     data = b""
@@ -87,9 +89,9 @@ def recv_exact(conn: socket.socket, n: int) -> bytes:
             raise ConnectionError("connection closed while receiving data")
         data += chunk
     return data
-#===== TCP TRANSFER HELPERS END POINT =====
+#===== SECTION 3: TCP TRANSFER HELPERS END POINT =====
 
-#===== RECEIVER BACKGROUND THREAD START POINT =====
+#===== SECTION 4: RECEIVER BACKGROUND THREAD START POINT =====
 class ReceiverWorker(QThread):
     #emits the saved file path so ui can update list and optionally auto-load
     file_received = pyqtSignal(str)
@@ -198,9 +200,9 @@ class ReceiverWorker(QThread):
         finally:
             #receiver ended normally or due to crash
             self.status.emit(False)
-#===== RECEIVER BACKGROUND THREAD END POINT =====
+#===== SECTION 4: RECEIVER BACKGROUND THREAD END POINT =====
 
-#===== CAMERA AND PICKING MATH START POINT =====
+#===== SECTION 5: CAMERA AND PICKING MATH START POINT =====
 def _normalize(v: np.ndarray) -> np.ndarray:
     #safe unit-vector helper used in camera ray math
     n = float(np.linalg.norm(v))
@@ -300,9 +302,9 @@ class SlotGLView(gl.GLViewWidget):
         except Exception:
             pass
         super().wheelEvent(ev)
-#===== CAMERA AND PICKING MATH END POINT =====
+#===== SECTION 5: CAMERA AND PICKING MATH END POINT =====
 
-#===== 3D VIEWPORT (9 SLOT GRID) START POINT =====
+#===== SECTION 6: 3D VIEWPORT (9 SLOT GRID) START POINT =====
 class MultiSlotPLYViewport(QWidget):
     slot_selected = pyqtSignal(int)
 
@@ -568,9 +570,9 @@ class MultiSlotPLYViewport(QWidget):
         )
         self.slot_points[slot_index].setGLOptions("opaque")
         self.slot_filled[slot_index] = True
-#===== 3D VIEWPORT (9 SLOT GRID) END POINT =====
+#===== SECTION 6: 3D VIEWPORT (9 SLOT GRID) END POINT =====
 
-#===== MAIN WINDOW (UI + APP LOGIC) START POINT =====
+#===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) START POINT =====
 class LidarWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -580,26 +582,26 @@ class LidarWindow(QMainWindow):
 
         self._closing = False
 
-        #===== UI CREATION START POINT =====
+        #===== SECTION 8: UI CREATION START POINT =====
         self._build_ui()
-        #===== UI CREATION END POINT =====
+        #===== SECTION 8: UI CREATION END POINT =====
 
-        #===== UI SIGNAL WIRING START POINT =====
+        #===== SECTION 9: UI SIGNAL WIRING START POINT =====
         self._wire_min_signals()
-        #===== UI SIGNAL WIRING END POINT =====
+        #===== SECTION 9: UI SIGNAL WIRING END POINT =====
 
-        #===== RECEIVER STARTUP START POINT =====
+        #===== SECTION 10: RECEIVER STARTUP START POINT =====
         self._start_receiver()
         self._log("ui initialized. receiver is running.")
-        #===== RECEIVER STARTUP END POINT =====
+        #===== SECTION 10: RECEIVER STARTUP END POINT =====
 
-        #===== IP REFRESH TIMER START POINT =====
+        #===== SECTION 11: IP REFRESH TIMER START POINT =====
         self._ip_timer = QTimer(self)
         self._ip_timer.setInterval(2500)
         self._ip_timer.timeout.connect(self._refresh_ip_label)
         self._ip_timer.start()
         self._refresh_ip_label()
-        #===== IP REFRESH TIMER END POINT =====
+        #===== SECTION 11: IP REFRESH TIMER END POINT =====
 
     def _start_receiver(self):
         #start tcp receiver in a background thread so ui stays responsive
@@ -712,12 +714,12 @@ class LidarWindow(QMainWindow):
             self._load_path_into_target_slot(saved_path)
 
     def _build_ui(self):
-        #===== UI LAYOUT START POINT =====
+        #===== SECTION 12: UI LAYOUT START POINT =====
         root = QWidget()
         self.setCentralWidget(root)
         main_layout = QHBoxLayout(root)
 
-        #===== LEFT COLUMN (QUEUE + STATUS) START POINT =====
+        #===== SECTION 13: LEFT COLUMN (QUEUE + STATUS) START POINT =====
         left = QVBoxLayout()
         main_layout.addLayout(left, 1)
 
@@ -757,9 +759,9 @@ class LidarWindow(QMainWindow):
         self.auto_load_chk = QCheckBox("Auto-load into selected slot (or next empty) after import/receive")
         self.auto_load_chk.setChecked(True)
         left.addWidget(self.auto_load_chk)
-        #===== LEFT COLUMN (QUEUE + STATUS) END POINT =====
+        #===== SECTION 13: LEFT COLUMN (QUEUE + STATUS) END POINT =====
 
-        #===== CENTER COLUMN (3D VIEW) START POINT =====
+        #===== SECTION 14: CENTER COLUMN (3D VIEW) START POINT =====
         center = QVBoxLayout()
         main_layout.addLayout(center, 3)
 
@@ -769,9 +771,9 @@ class LidarWindow(QMainWindow):
         hint = QLabel("Double-click INSIDE a cube footprint to select it. Drag to orbit. Mouse wheel zooms toward selected cube.")
         hint.setWordWrap(True)
         center.addWidget(hint)
-        #===== CENTER COLUMN (3D VIEW) END POINT =====
+        #===== SECTION 14: CENTER COLUMN (3D VIEW) END POINT =====
 
-        #===== RIGHT COLUMN (CONTROLS + LOG) START POINT =====
+        #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) START POINT =====
         right = QVBoxLayout()
         main_layout.addLayout(right, 1)
 
@@ -808,11 +810,11 @@ class LidarWindow(QMainWindow):
         self.log_lbl.setMinimumHeight(140)
         self.log_lbl.setStyleSheet("border: 1px solid #999; padding: 8px;")
         right.addWidget(self.log_lbl, 1)
-        #===== RIGHT COLUMN (CONTROLS + LOG) END POINT =====
-        #===== UI LAYOUT END POINT =====
+        #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
+        #===== SECTION 12: UI LAYOUT END POINT =====
 
     def _wire_min_signals(self):
-        #===== UI EVENTS START POINT =====
+        #===== SECTION 16: UI EVENTS START POINT =====
         self.btn_import_local.clicked.connect(self._import_local_clicked)
         self.btn_delete.clicked.connect(self._delete_selected_clicked)
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_target_slot)
@@ -881,13 +883,16 @@ class LidarWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
-#===== UI EVENTS END POINT =====
-#===== APP ENTRYPOINT START POINT =====
+#===== SECTION 16: UI EVENTS END POINT =====
+
+#===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) END POINT =====
+
+#===== SECTION 17: APP ENTRYPOINT START POINT =====
 def main():
     lidar_app = QApplication(sys.argv)
     lidar_main = LidarWindow()
     lidar_main.show()
     sys.exit(lidar_app.exec())
-#===== APP ENTRYPOINT END POINT =====
+#===== SECTION 17: APP ENTRYPOINT END POINT =====
 if __name__ == "__main__":
     main()
