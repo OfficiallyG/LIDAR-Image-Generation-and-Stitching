@@ -1,64 +1,76 @@
+#===== SECTION 1: IMPORTS START POINT =====
+#import time for timestamps, polling loop timing, and stability checks
 import time
+#import socket for tcp connection to the receiver laptop
 import socket
+#import struct for packing protocol headers (filename length and file size)
 import struct
+#import shutil for moving files into the sent archive after successful transfer
 import shutil
+#import pathlib path for clean folder and file path handling
 from pathlib import Path
+#===== SECTION 1: IMPORTS END POINT =====
 
-#NETWORK CONFIG
+
+#===== SECTION 2: NETWORK CONFIG START POINT =====
+#receiver laptop ip address (change as needed)
 LAPTOP_IP = "192.168.1.157"
-#Receiver laptop address (change as needed)
 
+#receiver listening port (must match the receiver script)
 PORT = 5001
-#Receiver listening port
+#===== SECTION 2: NETWORK CONFIG END POINT =====
 
-#FOLDER CONFIG
+
+#===== SECTION 3: FOLDER CONFIG START POINT =====
+#root folder for all transfers on this device
 BASE_DIR = Path.home() / "lidar_transfer"
-#Root folder for all transfers
 
+#lidar drops new .ply files here
 OUTGOING_DIR = BASE_DIR / "outgoing_ply"
-#LiDAR drops new .ply files here (code lidar to auto drop in this folder)
 
+#archive folder for files that were already sent
 SENT_DIR = BASE_DIR / "sent_ply"
-#Archive for already-sent files
 
+#create base and subfolders if missing
 BASE_DIR.mkdir(parents=True, exist_ok=True)
-#Ensure base folder exists
-
 OUTGOING_DIR.mkdir(parents=True, exist_ok=True)
-#Ensure outgoing folder exists
-
 SENT_DIR.mkdir(parents=True, exist_ok=True)
-#Ensure sent folder exists
+#===== SECTION 3: FOLDER CONFIG END POINT =====
 
-# DEVICE IDENTIFICATION
+
+#===== SECTION 4: DEVICE IDENTIFICATION START POINT =====
+#tag added to outbound filenames to identify which lidar sent the scan
 DEVICE_ID = "LIDAR_01"
-#Used to tag files from this sender (when we have multiple lidars sending scans to the same laptop)
-#this helps avoid filename collisions and identify source
+#===== SECTION 4: DEVICE IDENTIFICATION END POINT =====
 
-# TRANSFER TUNING
+
+#===== SECTION 5: TRANSFER TUNING START POINT =====
 POLL_SECONDS = 1.0
-#Folder scan interval
 STABLE_SECONDS = 2.0
-#Required no-change time before sending
 RETRY_DELAY = 5.0
-#Wait time between failed sends
 CONNECT_TIMEOUT = 5.0
-#Socket connect timeout
 CHUNK_SIZE = 65536
-#Bytes sent per socket write
+#===== SECTION 5: TRANSFER TUNING END POINT =====
 
+
+#===== SECTION 6: FILE DISCOVERY START POINT =====
 def list_ply_files(folder: Path):
-    #Finds all .ply files in folder
-    return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".ply"])
+    #returns sorted list of .ply files in the outgoing folder
+    return sorted(
+        [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".ply"]
+    )
+#===== SECTION 6: FILE DISCOVERY END POINT =====
 
+
+#===== SECTION 7: FILE STABILITY CHECK START POINT =====
 def file_is_stable(path: Path, stable_seconds: float) -> bool:
-    #Prevents sending partially-written files
     try:
         last_size = path.stat().st_size
     except FileNotFoundError:
         return False
 
     start = time.time()
+
     while time.time() - start < stable_seconds:
         time.sleep(0.25)
         try:
@@ -77,14 +89,18 @@ def file_is_stable(path: Path, stable_seconds: float) -> bool:
         return False
 
     return True
+#===== SECTION 7: FILE STABILITY CHECK END POINT =====
 
+
+#===== SECTION 8: REMOTE FILENAME BUILDING START POINT =====
 def build_remote_filename(local_path: Path) -> bytes:
-    #Avoids filename collisions across multiple devices
     ts = time.strftime("%Y%m%d_%H%M%S")
     return f"{DEVICE_ID}__{ts}__{local_path.name}".encode("utf-8")
+#===== SECTION 8: REMOTE FILENAME BUILDING END POINT =====
 
+
+#===== SECTION 9: TCP SEND PROTOCOL START POINT =====
 def send_file(path: Path) -> None:
-    #Implements sender-side transfer protocol
     file_size = path.stat().st_size
     remote_name = build_remote_filename(path)
 
@@ -93,11 +109,8 @@ def send_file(path: Path) -> None:
         s.connect((LAPTOP_IP, PORT))
 
         s.sendall(struct.pack("!I", len(remote_name)))
-        #Filename length header
         s.sendall(remote_name)
-        #Filename payload
         s.sendall(struct.pack("!Q", file_size))
-        #File size header
 
         with open(path, "rb") as f:
             while True:
@@ -105,10 +118,11 @@ def send_file(path: Path) -> None:
                 if not chunk:
                     break
                 s.sendall(chunk)
-                #Raw file data stream
+#===== SECTION 9: TCP SEND PROTOCOL END POINT =====
 
+
+#===== SECTION 10: POST-SEND ARCHIVE START POINT =====
 def move_to_sent(src: Path) -> Path:
-    #Prevents re-sending same file
     dst = SENT_DIR / src.name
     base, suffix = dst.stem, dst.suffix
     i = 1
@@ -119,15 +133,18 @@ def move_to_sent(src: Path) -> Path:
 
     shutil.move(str(src), str(dst))
     return dst
+#===== SECTION 10: POST-SEND ARCHIVE END POINT =====
 
+
+#===== SECTION 11: MAIN LOOP START POINT =====
 def main():
     sent_signatures = set()
-    #Tracks (path,size) pairs already sent
 
     while True:
         try:
             for ply in list_ply_files(OUTGOING_DIR):
                 sig = (str(ply.resolve()), ply.stat().st_size)
+
                 if sig in sent_signatures:
                     continue
 
@@ -148,6 +165,10 @@ def main():
 
         except KeyboardInterrupt:
             break
+#===== SECTION 11: MAIN LOOP END POINT =====
 
+
+#===== SECTION 12: ENTRYPOINT START POINT =====
 if __name__ == "__main__":
     main()
+#===== SECTION 12: ENTRYPOINT END POINT =====
