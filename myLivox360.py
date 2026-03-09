@@ -21,7 +21,9 @@ def network_lidar_reader(filter_func = lambda x, y, z: True):
 
     #join multicast group to "hear" sdk data
     group = socket.inet_aton("224.1.1.5")
-    mreq = struct.pack("4sL", group, socket.INADDR_ANY)
+
+    iface_ip = socket.inet_aton("192.168.10.50")  # Pi eth0 IP
+    mreq = struct.pack("4s4s", group, iface_ip)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
     udp_pktnum = frame_udp_count
