@@ -794,6 +794,7 @@ class LidarWindow(QMainWindow):
         info_group = QGroupBox("File Info")
         info_layout = QVBoxLayout(info_group)
         self.info_lbl = QLabel("No file loaded.")
+        self.info_lbl.setFixedSize(250,30)
         self.info_lbl.setWordWrap(True)
         info_layout.addWidget(self.info_lbl)
         right.addWidget(info_group)
@@ -808,6 +809,7 @@ class LidarWindow(QMainWindow):
         self.log_lbl.setWordWrap(True)
         self.log_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.log_lbl.setMinimumHeight(140)
+        self.log_lbl.setFixedWidth(280)
         self.log_lbl.setStyleSheet("border: 1px solid #999; padding: 8px;")
         right.addWidget(self.log_lbl, 1)
         #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
