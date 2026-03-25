@@ -10,7 +10,7 @@ import struct
 #import pathlib for safe cross-platform path building
 from pathlib import Path
 #import typing for clearer intent in function signatures
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 #import numpy for fast math and array operations for point clouds
 import numpy as np
@@ -221,8 +221,16 @@ PLY_DTYPE_MAP = {
 }
 
 
-def read_ply_xyz(path: str) -> np.ndarray:
-    #read xyz vertices from ascii or binary little-endian ply files
+def _get_structured_channel(data: np.ndarray, names: List[str]) -> Optional[np.ndarray]:
+    #return the first available named channel from a structured array
+    for name in names:
+        if name in data.dtype.names:
+            return np.asarray(data[name])
+    return None
+
+
+def read_ply_data(path: str) -> Dict[str, Any]:
+    #read xyz vertices and optional rgb/intensity from ascii or binary little-endian ply files
     with open(path, "rb") as f:
         fmt = None
         vertex_count = None
@@ -266,10 +274,24 @@ def read_ply_xyz(path: str) -> np.ndarray:
             raise ValueError("ply does not contain x y z columns")
 
         if fmt == "ascii":
-            data = np.loadtxt(f, dtype=np.float64, usecols=[prop_names.index("x"), prop_names.index("y"), prop_names.index("z")], max_rows=vertex_count)
+            data = np.loadtxt(f, dtype=np.float64, max_rows=vertex_count)
             if data.ndim == 1:
-                data = data.reshape(1, 3)
-            return data.astype(np.float32)
+                data = data.reshape(1, -1)
+            xyz = data[:, [prop_names.index("x"), prop_names.index("y"), prop_names.index("z")]].astype(np.float32)
+
+            rgb = None
+            rgb_names = ["red", "green", "blue"]
+            if all(name in prop_names for name in rgb_names):
+                rgb = data[:, [prop_names.index("red"), prop_names.index("green"), prop_names.index("blue")]]
+                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+            intensity = None
+            for name in ["intensity", "reflectivity"]:
+                if name in prop_names:
+                    intensity = data[:, prop_names.index(name)].astype(np.float32)
+                    break
+
+            return {"xyz": xyz, "rgb": rgb, "intensity": intensity}
 
         if fmt != "binary_little_endian":
             raise ValueError(f"unsupported ply format: {fmt}")
@@ -283,7 +305,236 @@ def read_ply_xyz(path: str) -> np.ndarray:
         vertex_dtype = np.dtype(dtype_fields)
         data = np.fromfile(f, dtype=vertex_dtype, count=vertex_count)
         xyz = np.column_stack((data["x"], data["y"], data["z"]))
-        return xyz.astype(np.float32)
+
+        rgb = None
+        rgb_channels = [
+            _get_structured_channel(data, ["red", "r"]),
+            _get_structured_channel(data, ["green", "g"]),
+            _get_structured_channel(data, ["blue", "b"]),
+        ]
+        if all(ch is not None for ch in rgb_channels):
+            rgb = np.column_stack(rgb_channels)
+            rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+        intensity = _get_structured_channel(data, ["intensity", "reflectivity"])
+        if intensity is not None:
+            intensity = intensity.astype(np.float32)
+
+        return {"xyz": xyz.astype(np.float32), "rgb": rgb, "intensity": intensity}
+
+
+def read_ply_xyz(path: str) -> np.ndarray:
+    #backward-compatible xyz-only loader
+    return read_ply_data(path)["xyz"]
+
+
+def write_ply_xyzrgb_ascii(path: str, xyz: np.ndarray, rgb: Optional[np.ndarray] = None):
+    #save an edited point cloud as ascii ply with optional rgb colors
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError("xyz must be an Nx3 array")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {xyz.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        use_rgb = rgb is not None and len(rgb) == len(xyz)
+        if use_rgb:
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        if use_rgb:
+            rgb = np.clip(np.asarray(rgb), 0, 255).astype(np.uint8)
+            for p, c in zip(xyz, rgb):
+                f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+        else:
+            for p in xyz:
+                f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+
+
+def _normalize_unit(values: np.ndarray) -> np.ndarray:
+    #normalize a 1d array into the 0..1 range
+    values = np.asarray(values, dtype=np.float32)
+    if values.size == 0:
+        return values
+    lo = float(np.percentile(values, 2))
+    hi = float(np.percentile(values, 98))
+    if (hi - lo) < 1e-6:
+        lo = float(values.min())
+        hi = float(values.max())
+        if (hi - lo) < 1e-6:
+            return np.zeros_like(values, dtype=np.float32)
+    return np.clip((values - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+def _smooth_gradient_colors(t: np.ndarray) -> np.ndarray:
+    #build smooth high-contrast rgb colors from 0..1 values
+    anchors = np.array([
+        [0.05, 0.05, 0.10],
+        [0.15, 0.35, 0.95],
+        [0.10, 0.80, 0.75],
+        [0.20, 0.95, 0.20],
+        [0.98, 0.90, 0.15],
+        [0.98, 0.35, 0.10],
+        [0.95, 0.15, 0.20],
+    ], dtype=np.float32)
+    t = np.clip(np.asarray(t, dtype=np.float32), 0.0, 1.0)
+    nseg = anchors.shape[0] - 1
+    u = t * nseg
+    i0 = np.floor(u).astype(np.int32)
+    i0 = np.clip(i0, 0, nseg - 1)
+    frac = (u - i0).astype(np.float32)
+    rgb = (1.0 - frac[:, None]) * anchors[i0] + frac[:, None] * anchors[i0 + 1]
+    return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
+
+def voxel_downsample_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] = None, voxel_size: float = 0.05) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    #merge nearby points into voxel centroids so scans render cleaner and faster
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if xyz.size == 0:
+        return xyz, rgb
+    voxel_size = max(1e-4, float(voxel_size))
+    mins = xyz.min(axis=0)
+    keys = np.floor((xyz - mins) / voxel_size).astype(np.int32)
+    uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+
+    counts = np.bincount(inverse).astype(np.float32)
+    out_xyz = np.zeros((len(uniq), 3), dtype=np.float32)
+    for dim in range(3):
+        out_xyz[:, dim] = np.bincount(inverse, weights=xyz[:, dim], minlength=len(uniq)) / counts
+
+    out_rgb = None
+    if rgb is not None and len(rgb) == len(xyz):
+        rgbf = rgb.astype(np.float32)
+        out_rgb = np.zeros((len(uniq), 3), dtype=np.float32)
+        for dim in range(3):
+            out_rgb[:, dim] = np.bincount(inverse, weights=rgbf[:, dim], minlength=len(uniq)) / counts
+        out_rgb = np.clip(out_rgb, 0, 255).astype(np.uint8)
+
+    return out_xyz, out_rgb
+
+
+def statistical_outlier_filter_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] = None, k: int = 12, z_thresh: float = 1.2) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    #remove stray points using local neighbor distances without external deps
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) <= max(8, k + 1):
+        return xyz, rgb
+
+    sample_cap = 2500
+    if len(xyz) > sample_cap:
+        idx = np.linspace(0, len(xyz) - 1, sample_cap, dtype=np.int32)
+        ref = xyz[idx]
+    else:
+        ref = xyz
+
+    d2 = np.sum((xyz[:, None, :] - ref[None, :, :]) ** 2, axis=2)
+    kk = min(k + 1, d2.shape[1])
+    nearest = np.partition(d2, kk - 1, axis=1)[:, :kk]
+    mean_neighbor_dist = np.sqrt(np.maximum(nearest[:, 1:], 0.0)).mean(axis=1)
+    mu = float(mean_neighbor_dist.mean())
+    sigma = float(mean_neighbor_dist.std())
+    limit = mu + max(1e-6, z_thresh * sigma)
+    keep = mean_neighbor_dist <= limit
+
+    out_xyz = xyz[keep]
+    out_rgb = rgb[keep] if rgb is not None and len(rgb) == len(xyz) else None
+    return out_xyz, out_rgb
+
+
+def remove_ceiling_only_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    #keep the room and floor intact, but trim only the highest ceiling band
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) < 100:
+        floor_ref = float(np.percentile(xyz[:, 2], 3)) if len(xyz) else 0.0
+        return xyz, rgb, xyz[:, 2] - floor_ref if len(xyz) else None
+
+    z = xyz[:, 2]
+    low_ref = float(np.percentile(z, 3))
+    high_p = float(np.percentile(z, 96))
+    room_span = max(high_p - low_ref, 1e-6)
+
+    ceiling_margin = float(np.clip(room_span * 0.06, 0.05, 0.24))
+    high_cut = high_p - ceiling_margin
+    keep = z <= high_cut
+
+    #if trim was too aggressive, back off to a lighter ceiling-only trim
+    if keep.sum() < max(50, int(len(xyz) * 0.50)):
+        high_cut = float(np.percentile(z, 98))
+        keep = z <= high_cut
+
+    #if still too aggressive, keep original geometry
+    if keep.sum() < max(50, int(len(xyz) * 0.50)):
+        return xyz, rgb, z - low_ref
+
+    out_xyz = xyz[keep]
+    out_rgb = rgb[keep] if rgb is not None and len(rgb) == len(xyz) else None
+    floor_ref = float(np.percentile(out_xyz[:, 2], 3))
+    return out_xyz, out_rgb, out_xyz[:, 2] - floor_ref
+
+
+def build_edited_colors(xyz: np.ndarray, intensity: Optional[np.ndarray] = None, height_from_floor: Optional[np.ndarray] = None) -> np.ndarray:
+    #create a strong tactical-style color pass for the edited scan
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if height_from_floor is None or len(height_from_floor) != len(xyz):
+        height_from_floor = xyz[:, 2]
+
+    height_t = _normalize_unit(height_from_floor)
+    dist = np.linalg.norm(xyz[:, :2], axis=1)
+    dist_t = _normalize_unit(dist)
+
+    if intensity is not None and len(intensity) == len(xyz):
+        intensity_t = _normalize_unit(intensity)
+        blend = (0.55 * height_t) + (0.20 * (1.0 - dist_t)) + (0.25 * intensity_t)
+    else:
+        blend = (0.70 * height_t) + (0.30 * (1.0 - dist_t))
+
+    return _smooth_gradient_colors(blend)
+
+
+def cleanup_scan_to_new_file(input_path: str) -> str:
+    #clean a scan, save an edited copy, and return the new file path
+    data = read_ply_data(input_path)
+    xyz = data["xyz"]
+    rgb = data.get("rgb")
+    intensity = data.get("intensity")
+
+    if xyz.size == 0:
+        raise ValueError("scan contains no points")
+
+    mins = xyz.min(axis=0)
+    maxs = xyz.max(axis=0)
+    span = np.maximum(maxs - mins, 1e-6)
+    max_span = float(np.max(span))
+    voxel_size = float(np.clip(max_span / 220.0, 0.025, 0.120))
+
+    xyz, rgb = voxel_downsample_numpy(xyz, rgb, voxel_size=voxel_size)
+    xyz, rgb = statistical_outlier_filter_numpy(xyz, rgb, k=14, z_thresh=1.0)
+    xyz, rgb, height_from_floor = remove_ceiling_only_numpy(xyz, rgb)
+
+    #run one more lighter outlier pass after ceiling trimming
+    xyz, rgb = statistical_outlier_filter_numpy(xyz, rgb, k=10, z_thresh=0.95)
+    if len(xyz) > 0:
+        floor_ref = float(np.percentile(xyz[:, 2], 3))
+        height_from_floor = xyz[:, 2] - floor_ref
+        if intensity is not None and len(intensity) != len(xyz):
+            intensity = None
+
+    edited_rgb = build_edited_colors(xyz, intensity=None, height_from_floor=height_from_floor)
+
+    src = Path(input_path)
+    output_path = src.with_name(f"{src.stem}_edited{src.suffix}")
+    counter = 1
+    while output_path.exists():
+        output_path = src.with_name(f"{src.stem}_edited_{counter}{src.suffix}")
+        counter += 1
+
+    write_ply_xyzrgb_ascii(str(output_path), xyz, edited_rgb)
+    return str(output_path)
 #===== SECTION 5: PLY LOADING HELPERS END POINT =====
 
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) START POINT =====
@@ -358,8 +609,10 @@ class SinglePLYViewport(QWidget):
         return np.hstack((rgb, np.ones((rgb.shape[0], 1), dtype=np.float32)))
 
     def load_ply(self, path: str):
-        #load one ply, fit it into view, color it by height, and replace the current scan
-        pos = read_ply_xyz(path)
+        #load one ply, fit it into view, and replace the current scan
+        data = read_ply_data(path)
+        pos = data["xyz"]
+        rgb = data.get("rgb")
         if pos.size == 0:
             raise ValueError("ply contains no vertices")
 
@@ -371,9 +624,12 @@ class SinglePLYViewport(QWidget):
         fit_scale = 25.0 / max_span
         pos_local = (pos - center) * fit_scale
 
-        z = pos_local[:, 2]
-        t = self._robust_normalize(z)
-        color = self._height_colors_smooth(t)
+        if rgb is not None and len(rgb) == len(pos):
+            color = np.hstack((rgb.astype(np.float32) / 255.0, np.ones((len(rgb), 1), dtype=np.float32)))
+        else:
+            z = pos_local[:, 2]
+            t = self._robust_normalize(z)
+            color = self._height_colors_smooth(t)
 
         self.point_cloud_item.setData(
             pos=pos_local.astype(np.float32),
@@ -397,6 +653,7 @@ class LidarWindow(QMainWindow):
         self.setGeometry(250, 250, 1100, 650)
 
         self._closing = False
+        self.current_loaded_path: Optional[str] = None
 
         #===== SECTION 8: UI CREATION START POINT =====
         self._build_ui()
@@ -474,9 +731,9 @@ class LidarWindow(QMainWindow):
         self.receiver_status_lbl.setText("Receiver: NOT RUNNING")
 
     def _load_path_into_viewer(self, path: str):
-        #load a file into the single viewer and replace the current scan
         try:
             self.viewer3d.load_ply(path)
+            self.current_loaded_path = path
             self._log(f"loaded scan: {os.path.basename(path)}")
             self.info_lbl.setText(f"Loaded:\n{os.path.basename(path)}")
         except Exception as e:
@@ -485,13 +742,38 @@ class LidarWindow(QMainWindow):
     def _on_file_received(self, saved_path: str):
         #add the received file to the queue list and optionally auto-load it
         filename = os.path.basename(saved_path)
-        item = QListWidgetItem(filename)
-        item.setData(Qt.ItemDataRole.UserRole, saved_path)
-        self.scan_list.addItem(item)
+        self._add_queue_item(filename, saved_path)
         self._log(f"received -> Desktop/LiDAR_Inbox: {filename}")
 
         if self.auto_load_chk.isChecked():
             self._load_path_into_viewer(saved_path)
+
+
+    def _add_queue_item(self, display_name: str, actual_path: str):
+        #add a file to the queue with a display label that can differ from the disk filename
+        item = QListWidgetItem(display_name)
+        item.setData(Qt.ItemDataRole.UserRole, actual_path)
+        self.scan_list.addItem(item)
+
+    def _cleanup_scan_clicked(self):
+        #create an edited version of the currently loaded scan and add it back to the queue
+        if not self.current_loaded_path or not os.path.exists(self.current_loaded_path):
+            self._log("cleanup failed: load a scan first.")
+            return
+
+        try:
+            self.progress.setRange(0, 0)
+            self._log(f"cleaning scan: {os.path.basename(self.current_loaded_path)}")
+            edited_path = cleanup_scan_to_new_file(self.current_loaded_path)
+            display_name = f"{Path(edited_path).stem.replace('_edited', ' (edited)', 1)}{Path(edited_path).suffix}"
+            self._add_queue_item(display_name, edited_path)
+            self._log(f"edited scan saved: {os.path.basename(edited_path)}")
+            self._load_path_into_viewer(edited_path)
+        except Exception as e:
+            self._log(f"cleanup failed: {e}")
+        finally:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
 
     def _build_ui(self):
         #===== SECTION 12: UI LAYOUT START POINT =====
@@ -565,7 +847,9 @@ class LidarWindow(QMainWindow):
         render_layout = QVBoxLayout(render_group)
 
         self.btn_clear_view = QPushButton("Clear Viewer")
+        self.btn_cleanup_scan = QPushButton("Clean Up Scan")
         render_layout.addWidget(self.btn_clear_view)
+        render_layout.addWidget(self.btn_cleanup_scan)
         self.right_layout.addWidget(render_group)
 
         info_group = QGroupBox("File Info")
@@ -598,6 +882,7 @@ class LidarWindow(QMainWindow):
         self.btn_delete.clicked.connect(self._delete_selected_clicked)
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_viewer)
         self.btn_clear_view.clicked.connect(self._clear_view_clicked)
+        self.btn_cleanup_scan.clicked.connect(self._cleanup_scan_clicked)
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
 
     def _toggle_right_panel(self):
@@ -610,6 +895,7 @@ class LidarWindow(QMainWindow):
 
     def _clear_view_clicked(self):
         self.viewer3d.clear_view()
+        self.current_loaded_path = None
         self.info_lbl.setText("No file loaded.")
         self._log("cleared viewer.")
 
@@ -627,9 +913,7 @@ class LidarWindow(QMainWindow):
 
         for path in file_paths:
             filename = os.path.basename(path)
-            item = QListWidgetItem(filename)
-            item.setData(Qt.ItemDataRole.UserRole, path)
-            self.scan_list.addItem(item)
+            self._add_queue_item(filename, path)
             self._log(f"imported local file: {filename}")
 
         if self.auto_load_chk.isChecked() and file_paths:
