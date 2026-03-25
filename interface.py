@@ -303,7 +303,7 @@ class SinglePLYViewport(QWidget):
         try:
             self.view.setBackgroundColor("k")
         except Exception:
-            self.view.opts["bgcolor"] = (255, 255, 255, 255)
+            self.view.opts["bgcolor"] = (0, 0, 0, 255)
 
         layout.addWidget(self.view)
 
@@ -539,6 +539,9 @@ class LidarWindow(QMainWindow):
         self.auto_load_chk = QCheckBox("Auto-load after import/receive")
         self.auto_load_chk.setChecked(True)
         left.addWidget(self.auto_load_chk)
+
+        self.btn_toggle_right = QPushButton("Hide Side Panel")
+        left.addWidget(self.btn_toggle_right)
         #===== SECTION 13: LEFT COLUMN (QUEUE + STATUS) END POINT =====
 
         #===== SECTION 14: CENTER COLUMN (3D VIEW) START POINT =====
@@ -554,15 +557,16 @@ class LidarWindow(QMainWindow):
         #===== SECTION 14: CENTER COLUMN (3D VIEW) END POINT =====
 
         #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) START POINT =====
-        right = QVBoxLayout()
-        main_layout.addLayout(right, 1)
+        self.right_panel = QWidget()
+        self.right_layout = QVBoxLayout(self.right_panel)
+        main_layout.addWidget(self.right_panel, 1)
 
         render_group = QGroupBox("Render Controls")
         render_layout = QVBoxLayout(render_group)
 
         self.btn_clear_view = QPushButton("Clear Viewer")
         render_layout.addWidget(self.btn_clear_view)
-        right.addWidget(render_group)
+        self.right_layout.addWidget(render_group)
 
         info_group = QGroupBox("File Info")
         info_layout = QVBoxLayout(info_group)
@@ -570,21 +574,21 @@ class LidarWindow(QMainWindow):
         self.info_lbl.setFixedSize(250, 30)
         self.info_lbl.setWordWrap(True)
         info_layout.addWidget(self.info_lbl)
-        right.addWidget(info_group)
+        self.right_layout.addWidget(info_group)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        right.addWidget(self.progress)
+        self.right_layout.addWidget(self.progress)
 
-        right.addWidget(QLabel("Log"))
+        self.right_layout.addWidget(QLabel("Log"))
         self.log_lbl = QLabel("")
         self.log_lbl.setWordWrap(True)
         self.log_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.log_lbl.setMinimumHeight(140)
         self.log_lbl.setFixedWidth(280)
         self.log_lbl.setStyleSheet("border: 1px solid #999; padding: 8px;")
-        right.addWidget(self.log_lbl, 1)
+        self.right_layout.addWidget(self.log_lbl, 1)
         #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
         #===== SECTION 12: UI LAYOUT END POINT =====
 
@@ -594,6 +598,15 @@ class LidarWindow(QMainWindow):
         self.btn_delete.clicked.connect(self._delete_selected_clicked)
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_viewer)
         self.btn_clear_view.clicked.connect(self._clear_view_clicked)
+        self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
+
+    def _toggle_right_panel(self):
+        if self.right_panel.isVisible():
+            self.right_panel.hide()
+            self.btn_toggle_right.setText("Show Side Panel")
+        else:
+            self.right_panel.show()
+            self.btn_toggle_right.setText("Hide Side Panel")
 
     def _clear_view_clicked(self):
         self.viewer3d.clear_view()
