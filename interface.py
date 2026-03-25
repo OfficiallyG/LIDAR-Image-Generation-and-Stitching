@@ -301,7 +301,7 @@ class SinglePLYViewport(QWidget):
 
         #make background white for better contrast in screenshots
         try:
-            self.view.setBackgroundColor("w")
+            self.view.setBackgroundColor("k")
         except Exception:
             self.view.opts["bgcolor"] = (255, 255, 255, 255)
 
