@@ -7,6 +7,10 @@ import os
 import socket
 #import struct for packing/unpacking fixed-size integers in the transfer protocol
 import struct
+#import tempfile for safe temporary stitched file names during multi-file merges
+import tempfile
+#import copy for open3d point cloud duplication during stitching
+import copy
 #import pathlib for safe cross-platform path building
 from pathlib import Path
 #import typing for clearer intent in function signatures
@@ -14,6 +18,7 @@ from typing import Optional, List, Tuple, Dict, Any
 
 #import numpy for fast math and array operations for point clouds
 import numpy as np
+#import open3d lazily inside stitch functions so the app can still open even if stitching deps are missing
 #import pyqtgraph.opengl for 3d rendering widgets/items
 import pyqtgraph.opengl as gl
 #import qt core for ui constants, background thread, signals, and timers
@@ -32,7 +37,9 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QProgressBar,
     QCheckBox,
-    QFileDialog
+    QFileDialog,
+    QMessageBox,
+    QAbstractItemView
 )
 #===== SECTION 1: IMPORTS END POINT =====
 
@@ -524,7 +531,7 @@ def cleanup_scan_to_new_file(input_path: str) -> str:
         if intensity is not None and len(intensity) != len(xyz):
             intensity = None
 
-    edited_rgb = build_edited_colors(xyz, intensity=None, height_from_floor=height_from_floor)
+    edited_rgb = build_height_colors_rgb(xyz)
 
     src = Path(input_path)
     output_path = src.with_name(f"{src.stem}_edited{src.suffix}")
@@ -536,6 +543,151 @@ def cleanup_scan_to_new_file(input_path: str) -> str:
     write_ply_xyzrgb_ascii(str(output_path), xyz, edited_rgb)
     return str(output_path)
 #===== SECTION 5: PLY LOADING HELPERS END POINT =====
+
+
+
+#===== SECTION 5B: STITCHING HELPERS START POINT =====
+
+
+def build_stitched_output_path(input_paths: List[str]) -> str:
+    #build a safe stitched output filename next to the first selected file
+    if not input_paths:
+        raise ValueError("no input paths were provided for stitching")
+
+    first_path = Path(input_paths[0])
+    parent = first_path.parent if first_path.parent.exists() else INBOX_DIR
+
+    if len(input_paths) == 2:
+        base_name = f"{Path(input_paths[0]).stem}_{Path(input_paths[1]).stem}_stitched"
+    else:
+        base_name = f"multi_{len(input_paths)}_scan_stitched"
+
+    safe_base = "".join(ch if ch.isalnum() or ch in ('_', '-', ' ') else '_' for ch in base_name).strip()
+    safe_base = safe_base.replace(' ', '_') or 'stitched_output'
+
+    output_path = parent / f"{safe_base}.ply"
+    counter = 1
+    while output_path.exists():
+        output_path = parent / f"{safe_base}_{counter}.ply"
+        counter += 1
+    return str(output_path)
+def build_height_colors_rgb(xyz: np.ndarray) -> np.ndarray:
+    #apply one consistent height-based color scheme for regular, cleaned, and stitched scans
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if xyz.size == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    floor_ref = float(np.percentile(xyz[:, 2], 3))
+    height_from_floor = xyz[:, 2] - floor_ref
+    return _smooth_gradient_colors(_normalize_unit(height_from_floor))
+
+
+def build_height_colors_rgba(xyz: np.ndarray) -> np.ndarray:
+    #same color mapping as the saved edited scans, just converted for the gl viewer
+    rgb = build_height_colors_rgb(xyz).astype(np.float32) / 255.0
+    if len(rgb) == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+    return np.hstack((rgb, np.ones((len(rgb), 1), dtype=np.float32)))
+
+
+def _import_open3d():
+    #import open3d only when stitching is actually used so startup does not fail on machines missing the package
+    try:
+        import open3d as o3d
+        return o3d
+    except Exception as e:
+        raise ImportError(
+            "Open3D is required for stitching. Install it with: pip install open3d"
+        ) from e
+
+
+def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, distance_threshold: float = 0.2) -> str:
+    #direct built-in version of the provided open3d icp stitch algorithm for two scans
+    o3d = _import_open3d()
+    source = o3d.io.read_point_cloud(source_path)
+    target = o3d.io.read_point_cloud(target_path)
+
+    if source.is_empty():
+        raise ValueError(f"source cloud is empty: {os.path.basename(source_path)}")
+    if target.is_empty():
+        raise ValueError(f"target cloud is empty: {os.path.basename(target_path)}")
+
+    initial_guess = np.identity(4)
+    icp_result = o3d.pipelines.registration.registration_icp(
+        source,
+        target,
+        distance_threshold,
+        initial_guess,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+    )
+
+    source_aligned = copy.deepcopy(source)
+    source_aligned.transform(icp_result.transformation)
+
+    merged_cloud = source_aligned + target
+    voxel_size = max(distance_threshold / 5.0, 1e-4)
+    merged_cloud = merged_cloud.voxel_down_sample(voxel_size=voxel_size)
+
+    if not o3d.io.write_point_cloud(output_path, merged_cloud):
+        raise IOError(f"failed to save stitched model to {output_path}")
+    return output_path
+
+
+def stitch_multiple_ply_files(input_paths: List[str], output_path: str, distance_threshold: float = 0.2) -> str:
+    #run the two-file icp stitch repeatedly so any number of selected scans can be merged
+    if len(input_paths) < 2:
+        raise ValueError("select at least 2 .ply scans to stitch")
+
+    ordered_paths = [str(Path(p)) for p in input_paths]
+    with tempfile.TemporaryDirectory(prefix="lidar_stitch_") as temp_dir:
+        running_path = ordered_paths[0]
+
+        for index, next_path in enumerate(ordered_paths[1:], start=1):
+            is_last_merge = index == (len(ordered_paths) - 1)
+            current_output = output_path if is_last_merge else str(Path(temp_dir) / f"partial_merge_{index}.ply")
+            stitch_two_ply_files(
+                source_path=next_path,
+                target_path=running_path,
+                output_path=current_output,
+                distance_threshold=distance_threshold,
+            )
+            running_path = current_output
+
+    return output_path
+
+
+class StitchWorker(QThread):
+    #emits the final stitched file path
+    finished_success = pyqtSignal(str)
+    #thread-safe logs to the ui
+    log = pyqtSignal(str)
+    #thread-safe stitch failure reporting
+    error = pyqtSignal(str)
+
+    def __init__(self, input_paths: List[str], output_path: str, parent=None):
+        super().__init__(parent)
+        self.input_paths = input_paths
+        self.output_path = output_path
+
+    def run(self):
+        #run the built-in multi-file stitcher using the selected queue items
+        try:
+            self.log.emit(f"[stitch] stitching {len(self.input_paths)} selected file(s)...")
+            for idx, path in enumerate(self.input_paths, start=1):
+                self.log.emit(f"[stitch] {idx}. {os.path.basename(path)}")
+
+            final_output = stitch_multiple_ply_files(self.input_paths, self.output_path)
+
+            if not os.path.exists(final_output):
+                raise FileNotFoundError(
+                    "stitching finished but no output .ply file was found on disk."
+                )
+
+            self.log.emit(f"[stitch] stitched file created: {os.path.basename(final_output)}")
+            self.finished_success.emit(final_output)
+
+        except Exception as e:
+            self.error.emit(f"[stitch] failed: {e}")
+#===== SECTION 5B: STITCHING HELPERS END POINT =====
 
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) START POINT =====
 class SinglePLYViewport(QWidget):
@@ -571,48 +723,10 @@ class SinglePLYViewport(QWidget):
         self.point_cloud_item.setData(pos=np.zeros((0, 3), dtype=np.float32))
         self.file_loaded = False
 
-    def _robust_normalize(self, z: np.ndarray) -> np.ndarray:
-        #normalize heights using percentiles so outliers do not dominate color mapping
-        if z.size == 0:
-            return z
-        lo = float(np.percentile(z, 2))
-        hi = float(np.percentile(z, 98))
-        if (hi - lo) < 1e-6:
-            lo = float(z.min())
-            hi = float(z.max())
-            if (hi - lo) < 1e-6:
-                return np.zeros_like(z, dtype=np.float32)
-        t = (z - lo) / (hi - lo)
-        return np.clip(t, 0.0, 1.0).astype(np.float32)
-
-    def _height_colors_smooth(self, t: np.ndarray) -> np.ndarray:
-        #map normalized heights to a smooth gradient rgba color
-        anchors = np.array([
-            [1.00, 0.92, 0.10],
-            [1.00, 0.55, 0.10],
-            [0.95, 0.15, 0.15],
-            [0.15, 0.45, 0.95],
-            [0.60, 0.25, 0.85],
-            [0.15, 0.80, 0.30],
-        ], dtype=np.float32)
-
-        t = np.clip(t, 0.0, 1.0)
-        nseg = anchors.shape[0] - 1
-        u = t * nseg
-        i0 = np.floor(u).astype(np.int32)
-        i0 = np.clip(i0, 0, nseg - 1)
-        f = (u - i0).astype(np.float32)
-
-        c0 = anchors[i0]
-        c1 = anchors[i0 + 1]
-        rgb = (1.0 - f[:, None]) * c0 + f[:, None] * c1
-        return np.hstack((rgb, np.ones((rgb.shape[0], 1), dtype=np.float32)))
-
     def load_ply(self, path: str):
         #load one ply, fit it into view, and replace the current scan
         data = read_ply_data(path)
         pos = data["xyz"]
-        rgb = data.get("rgb")
         if pos.size == 0:
             raise ValueError("ply contains no vertices")
 
@@ -624,12 +738,7 @@ class SinglePLYViewport(QWidget):
         fit_scale = 25.0 / max_span
         pos_local = (pos - center) * fit_scale
 
-        if rgb is not None and len(rgb) == len(pos):
-            color = np.hstack((rgb.astype(np.float32) / 255.0, np.ones((len(rgb), 1), dtype=np.float32)))
-        else:
-            z = pos_local[:, 2]
-            t = self._robust_normalize(z)
-            color = self._height_colors_smooth(t)
+        color = build_height_colors_rgba(pos)
 
         self.point_cloud_item.setData(
             pos=pos_local.astype(np.float32),
@@ -654,6 +763,7 @@ class LidarWindow(QMainWindow):
 
         self._closing = False
         self.current_loaded_path: Optional[str] = None
+        self.stitch_worker: Optional[StitchWorker] = None
 
         #===== SECTION 8: UI CREATION START POINT =====
         self._build_ui()
@@ -809,6 +919,7 @@ class LidarWindow(QMainWindow):
 
         left.addWidget(QLabel("Scans Queue"))
         self.scan_list = QListWidget()
+        self.scan_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         left.addWidget(self.scan_list, 1)
 
         file_btn_row = QHBoxLayout()
@@ -821,6 +932,9 @@ class LidarWindow(QMainWindow):
         self.auto_load_chk = QCheckBox("Auto-load after import/receive")
         self.auto_load_chk.setChecked(True)
         left.addWidget(self.auto_load_chk)
+
+        self.btn_stitch = QPushButton("Stitch")
+        left.addWidget(self.btn_stitch)
 
         self.btn_toggle_right = QPushButton("Hide Side Panel")
         left.addWidget(self.btn_toggle_right)
@@ -883,7 +997,63 @@ class LidarWindow(QMainWindow):
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_viewer)
         self.btn_clear_view.clicked.connect(self._clear_view_clicked)
         self.btn_cleanup_scan.clicked.connect(self._cleanup_scan_clicked)
+        self.btn_stitch.clicked.connect(self._stitch_clicked)
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
+
+
+    def _get_selected_queue_paths(self) -> List[str]:
+        #return valid file paths for all currently selected queue items
+        selected_paths: List[str] = []
+        for item in self.scan_list.selectedItems():
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if path and os.path.exists(path):
+                selected_paths.append(path)
+        return selected_paths
+
+    def _stitch_clicked(self):
+        #run the built-in stitching algorithm on multiple selected scans
+        selected_paths = self._get_selected_queue_paths()
+        if len(selected_paths) < 2:
+            self._log("[stitch] select at least 2 scans in the queue first.")
+            QMessageBox.warning(self, "Stitch", "Select at least 2 scans in the queue before stitching.")
+            return
+
+        try:
+            output_path = build_stitched_output_path(selected_paths)
+            self._log(f"[stitch] output will be saved as: {os.path.basename(output_path)}")
+            self.progress.setRange(0, 0)
+            self.btn_stitch.setEnabled(False)
+
+            self.stitch_worker = StitchWorker(selected_paths, output_path, parent=self)
+            self.stitch_worker.log.connect(self._log)
+            self.stitch_worker.error.connect(self._on_stitch_error)
+            self.stitch_worker.finished_success.connect(self._on_stitch_success)
+            self.stitch_worker.finished.connect(self._on_stitch_finished)
+            self.stitch_worker.start()
+        except Exception as e:
+            self._log(f"[stitch] failed before worker start: {e}")
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+            self.btn_stitch.setEnabled(True)
+            QMessageBox.critical(self, "Stitch Failed", str(e))
+
+    def _on_stitch_success(self, stitched_path: str):
+        #add the stitched scan to the queue and load it into the viewer
+        display_name = os.path.basename(stitched_path)
+        self._add_queue_item(display_name, stitched_path)
+        self._load_path_into_viewer(stitched_path)
+        self._log(f"[stitch] success. added stitched scan: {display_name}")
+
+    def _on_stitch_error(self, msg: str):
+        #surface stitch errors to the user and the log
+        self._log(msg)
+        QMessageBox.critical(self, "Stitch Failed", msg.splitlines()[0])
+
+    def _on_stitch_finished(self):
+        #restore ui state after stitch worker exits
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.btn_stitch.setEnabled(True)
 
     def _toggle_right_panel(self):
         if self.right_panel.isVisible():
@@ -949,6 +1119,13 @@ class LidarWindow(QMainWindow):
                 self._log("stopping receiver...")
                 self.receiver.stop()
                 self.receiver.wait(1500)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "stitch_worker") and self.stitch_worker and self.stitch_worker.isRunning():
+                self._log("waiting for stitch worker to finish...")
+                self.stitch_worker.wait(1500)
         except Exception:
             pass
         super().closeEvent(event)
