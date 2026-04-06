@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import cv2
 import struct
 
-img_height, img_width, dist_max = 500, 500, 300 # 500x500 pixels, 300 cm max distance
+img_height, img_width, dist_max = 500, 500, 4000 # 500x500 pixels, 300 cm max distance
 lidar_port_number = 56301
 frame_udp_count = 209
 
