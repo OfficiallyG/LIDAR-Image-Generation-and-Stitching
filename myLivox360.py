@@ -9,9 +9,9 @@ import matplotlib.pyplot as plt
 import cv2
 import struct
 
-img_height, img_width, dist_max = 500, 500, 4000 # 500x500 pixels, 300 cm max distance
+img_height, img_width, dist_max = 500, 500, 4000 # 500x500 pixels, 4000 cm max distance
 lidar_port_number = 56301
-frame_udp_count = 209
+frame_udp_count = 418
 
 def network_lidar_reader(filter_func = lambda x, y, z: True):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
