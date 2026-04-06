@@ -3,6 +3,8 @@
 import sys
 #import os for safe filename handling and file existence checks
 import os
+#import re for compact 3-digit file naming with tags
+import re
 #import socket for tcp server and local ip discovery
 import socket
 #import struct for packing/unpacking fixed-size integers in the transfer protocol
@@ -179,17 +181,9 @@ class ReceiverWorker(QThread):
 
                             #prevent directory traversal from sender-provided paths
                             safe_name = os.path.basename(filename)
-                            out_path = inbox / safe_name
+                            out_path = build_short_raw_receive_path(inbox)
 
-                            #de-dupe filename if it already exists
-                            base = out_path.stem
-                            suffix = out_path.suffix
-                            i = 1
-                            while out_path.exists():
-                                out_path = inbox / f"{base}_{i}{suffix}"
-                                i += 1
-
-                            self.log.emit(f"[receiver] receiving: {safe_name} ({file_size} bytes)")
+                            self.log.emit(f"[receiver] receiving: {safe_name} -> {out_path.name} ({file_size} bytes)")
 
                             received = 0
                             with open(out_path, "wb") as f:
@@ -948,6 +942,69 @@ def remove_detected_ceiling_numpy(
     return out_xyz, out_rgb, out_intensity, float(cut_height)
 
 
+
+def _extract_short_base_and_tags(stem: str) -> Tuple[Optional[str], List[str]]:
+    #read names like 001, 001-f, 001-f-c, 001-x, etc.
+    m = re.fullmatch(r"(\d{3})(?:-([a-z](?:-[a-z])*))?", stem.lower())
+    if not m:
+        return None, []
+
+    base = m.group(1)
+    tag_str = m.group(2)
+    tags = tag_str.split("-") if tag_str else []
+    return base, tags
+
+
+def _next_short_base(parent: Path) -> str:
+    #find next available 3-digit id in this folder
+    used = set()
+
+    if parent.exists():
+        for p in parent.glob("*.ply"):
+            m = re.match(r"^(\d{3})(?:-[a-z](?:-[a-z])*)?$", p.stem.lower())
+            if m:
+                used.add(int(m.group(1)))
+
+    for i in range(1, 1000):
+        if i not in used:
+            return f"{i:03d}"
+
+    raise ValueError("no free 3-digit filenames left in this folder")
+
+
+def build_short_output_path(input_path: str, add_tags: List[str]) -> str:
+    #create compact names like 001.ply, 001-f.ply, 001-c.ply, 001-f-c.ply
+    src = Path(input_path)
+    parent = src.parent if src.parent.exists() else INBOX_DIR
+
+    base, existing_tags = _extract_short_base_and_tags(src.stem)
+    if base is None:
+        base = _next_short_base(parent)
+
+    tags = list(existing_tags)
+    for tag in add_tags:
+        tag = tag.lower().strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+
+    stem = base if not tags else f"{base}-{'-'.join(tags)}"
+    output_path = parent / f"{stem}{src.suffix}"
+
+    #if exact name already exists, move to a fresh 3-digit base
+    if output_path.exists():
+        base = _next_short_base(parent)
+        stem = base if not tags else f"{base}-{'-'.join(tags)}"
+        output_path = parent / f"{stem}{src.suffix}"
+
+    return str(output_path)
+
+
+def build_short_raw_receive_path(inbox_dir: Path) -> Path:
+    #assign the next raw incoming scan name like 001.ply, 002.ply, etc.
+    base = _next_short_base(inbox_dir)
+    return inbox_dir / f"{base}.ply"
+
+
 def cleanup_scan_to_new_file(input_path: str) -> str:
     #clean a scan gently so room detail is preserved while obvious floaters are removed
     data = read_ply_data(input_path)
@@ -975,12 +1032,7 @@ def cleanup_scan_to_new_file(input_path: str) -> str:
 
     edited_rgb = build_edited_colors(xyz, intensity=intensity, height_from_floor=xyz[:, 2] if len(xyz) else None)
 
-    src = Path(input_path)
-    output_path = src.with_name(f"{src.stem}_edited{src.suffix}")
-    counter = 1
-    while output_path.exists():
-        output_path = src.with_name(f"{src.stem}_edited_{counter}{src.suffix}")
-        counter += 1
+    output_path = build_short_output_path(input_path, ["c"])
 
     write_ply_xyzrgb_ascii(str(output_path), xyz, edited_rgb)
     return str(output_path)
@@ -1001,12 +1053,7 @@ def remove_ceiling_to_new_file(input_path: str) -> str:
 
     out_rgb = build_edited_colors(out_xyz, intensity=out_intensity, height_from_floor=out_xyz[:, 2] if len(out_xyz) else None)
 
-    src = Path(input_path)
-    output_path = src.with_name(f"{src.stem}_noceiling{src.suffix}")
-    counter = 1
-    while output_path.exists():
-        output_path = src.with_name(f"{src.stem}_noceiling_{counter}{src.suffix}")
-        counter += 1
+    output_path = build_short_output_path(input_path, ["r"])
 
     write_ply_xyzrgb_ascii(str(output_path), out_xyz, out_rgb)
     return str(output_path)
@@ -1051,12 +1098,7 @@ def stabilize_floor_to_new_file(input_path: str) -> str:
         height_from_floor=out_xyz[:, 2] if len(out_xyz) else None,
     )
 
-    src = Path(input_path)
-    output_path = src.with_name(f"{src.stem}_floored{src.suffix}")
-    counter = 1
-    while output_path.exists():
-        output_path = src.with_name(f"{src.stem}_floored_{counter}{src.suffix}")
-        counter += 1
+    output_path = build_short_output_path(input_path, ["f"])
 
     write_ply_xyzrgb_ascii(str(output_path), out_xyz, out_rgb)
     return str(output_path)
@@ -1086,12 +1128,7 @@ def flip_scan_180_to_new_file(input_path: str) -> str:
 
     out_rgb = build_edited_colors(out_xyz, intensity=intensity, height_from_floor=out_xyz[:, 2] if len(out_xyz) else None)
 
-    src = Path(input_path)
-    output_path = src.with_name(f"{src.stem}_flip180{src.suffix}")
-    counter = 1
-    while output_path.exists():
-        output_path = src.with_name(f"{src.stem}_flip180_{counter}{src.suffix}")
-        counter += 1
+    output_path = build_short_output_path(input_path, ["x"])
 
     write_ply_xyzrgb_ascii(str(output_path), out_xyz, out_rgb)
     return str(output_path)
@@ -1103,27 +1140,16 @@ def flip_scan_180_to_new_file(input_path: str) -> str:
 
 
 def build_stitched_output_path(input_paths: List[str]) -> str:
-    #build a safe stitched output filename next to the first selected file
+    #save stitched result with short 3-digit naming
     if not input_paths:
         raise ValueError("no input paths were provided for stitching")
 
     first_path = Path(input_paths[0])
     parent = first_path.parent if first_path.parent.exists() else INBOX_DIR
+    seed_input = str(parent / f"{_next_short_base(parent)}.ply")
+    return build_short_output_path(seed_input, ["s"])
 
-    if len(input_paths) == 2:
-        base_name = f"{Path(input_paths[0]).stem}_{Path(input_paths[1]).stem}_stitched"
-    else:
-        base_name = f"multi_{len(input_paths)}_scan_stitched"
 
-    safe_base = "".join(ch if ch.isalnum() or ch in ('_', '-', ' ') else '_' for ch in base_name).strip()
-    safe_base = safe_base.replace(' ', '_') or 'stitched_output'
-
-    output_path = parent / f"{safe_base}.ply"
-    counter = 1
-    while output_path.exists():
-        output_path = parent / f"{safe_base}_{counter}.ply"
-        counter += 1
-    return str(output_path)
 def build_height_colors_rgb(xyz: np.ndarray) -> np.ndarray:
     #apply one consistent height-based color scheme for regular, cleaned, and stitched scans
     xyz = np.asarray(xyz, dtype=np.float32)
@@ -1552,7 +1578,7 @@ class LidarWindow(QMainWindow):
             self.progress.setRange(0, 0)
             self._log(f"cleaning scan: {os.path.basename(self.current_loaded_path)}")
             edited_path = cleanup_scan_to_new_file(self.current_loaded_path)
-            display_name = f"{Path(edited_path).stem.replace('_edited', ' (edited)', 1)}{Path(edited_path).suffix}"
+            display_name = os.path.basename(edited_path)
             self._add_queue_item(display_name, edited_path)
             self._log(f"edited scan saved: {os.path.basename(edited_path)}")
             self._load_path_into_viewer(edited_path)
@@ -1572,7 +1598,7 @@ class LidarWindow(QMainWindow):
             self.progress.setRange(0, 0)
             self._log(f"stabilizing floor: {os.path.basename(self.current_loaded_path)}")
             floored_path = stabilize_floor_to_new_file(self.current_loaded_path)
-            display_name = f"{Path(floored_path).stem.replace('_floored', ' (floored)', 1)}{Path(floored_path).suffix}"
+            display_name = os.path.basename(floored_path)
             self._add_queue_item(display_name, floored_path)
             self._log(f"floored scan saved: {os.path.basename(floored_path)}")
             self._load_path_into_viewer(floored_path)
@@ -1592,7 +1618,7 @@ class LidarWindow(QMainWindow):
             self.progress.setRange(0, 0)
             self._log(f"flipping scan 180°: {os.path.basename(self.current_loaded_path)}")
             flipped_path = flip_scan_180_to_new_file(self.current_loaded_path)
-            display_name = f"{Path(flipped_path).stem.replace('_flip180', ' (flip180)', 1)}{Path(flipped_path).suffix}"
+            display_name = os.path.basename(flipped_path)
             self._add_queue_item(display_name, flipped_path)
             self._log(f"flipped scan saved: {os.path.basename(flipped_path)}")
             self._load_path_into_viewer(flipped_path)
@@ -1666,9 +1692,6 @@ class LidarWindow(QMainWindow):
         self.viewer3d = SinglePLYViewport()
         center.addWidget(self.viewer3d, 1)
 
-        hint = QLabel("Viewer shows one .ply scan at a time. Loading another file replaces the current scan.")
-        hint.setWordWrap(True)
-        center.addWidget(hint)
         #===== SECTION 14: CENTER COLUMN (3D VIEW) END POINT =====
 
         #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) START POINT =====
