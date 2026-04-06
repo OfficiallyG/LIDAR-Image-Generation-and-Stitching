@@ -9,15 +9,30 @@ import struct
 import shutil
 #import pathlib path for clean folder and file path handling
 from pathlib import Path
+#import configParser for reading config file
+import configparser
+#import tkinter for ip change gui
+import tkinter as tk
+#import messagebox for ip change verification
+from tkinter import messagebox 
 #===== SECTION 1: IMPORTS END POINT =====
 
 
 #===== SECTION 2: NETWORK CONFIG START POINT =====
-#receiver laptop ip address (change as needed)
-LAPTOP_IP = "192.168.1.157"
+#load and read config file
+CONFIG_FILE = "senderConfig.ini"
 
-#receiver listening port (must match the receiver script)
-PORT = 5001
+config = configparser.ConfigParser()
+config.read(CONFIG_FILE)
+
+#Set default laptop ip and port settings
+LAPTOP_IP = config.get("NETWORK","LAPTOP_IP")
+PORT = config.getint("NETWORK","PORT")
+
+#set default device number and create default device ip
+device_number = config.getint("DEVICE","DEVICE_NUM")
+DEVICE_ID = f"LIDAR_{device_number:02d}"
+
 #===== SECTION 2: NETWORK CONFIG END POINT =====
 
 
@@ -37,11 +52,68 @@ OUTGOING_DIR.mkdir(parents=True, exist_ok=True)
 SENT_DIR.mkdir(parents=True, exist_ok=True)
 #===== SECTION 3: FOLDER CONFIG END POINT =====
 
+#===== SECTION 4: CHANGE IP START POINT =====
+def changeAddress():
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE) # read current config file information
 
-#===== SECTION 4: DEVICE IDENTIFICATION START POINT =====
-#tag added to outbound filenames to identify which lidar sent the scan
-DEVICE_ID = "LIDAR_01"
-#===== SECTION 4: DEVICE IDENTIFICATION END POINT =====
+    #get current device settings
+    current_ip = config.get("NETWORK","LAPTOP_IP",fallback="192.168.1.157")
+    current_device = config.get("DEVICE","DEVICE_NUM",fallback="1")
+    current_port = config.get("NETWORK","PORT",fallback="5001")
+
+    #create ip changer GUI and entry boxes
+    root = tk.Tk()
+    root.title("Network and Device Settings")
+    root.geometry("300x150")
+
+    tk.Label(root,text="New IP:").pack(pady=(10,0))
+    ip_entry = tk.Entry(root)
+    ip_entry.insert(0,current_ip)
+    ip_entry.pack()
+
+    tk.Label(root,text="New Port:").pack(pady=(10,0))
+    port_entry = tk.Entry(root)
+    port_entry.insert(0,current_port)
+    port_entry.pack()
+
+    tk.Label(root,text="New Device Number").pack(pady=(10,0))
+    num_entry = tk.Entry(root)
+    num_entry.insert(0,current_device)
+    num_entry.pack()
+
+    def save_button(): # take new device and network settings and save to config file
+        new_ip = ip_entry.get().strip()
+        new_device = num_entry.get().strip()
+        new_port = port_entry.get().strip()
+
+        #if box is empty, show error message
+        if not new_ip:
+            messagebox.showerror("Error", "IP cannot be empty.")
+            return
+        if not new_device:
+            messagebox.showerror("Error", "Device number cannot be empty.")
+            return
+        if not new_port:
+            messagebox.showerror("Error", "Port number cannot be empty.")
+            return
+        
+        #enter new settings into config file
+        config["NETWORK"]["LAPTOP_IP"] = new_ip
+        config["DEVICE"]["DEVICE_NUM"] = new_device
+        config["NETWORK"]["PORT"] = new_port
+
+        with open(CONFIG_FILE, "w") as f:
+            config.write(f)
+
+        messagebox.showinfo("Success", "Settings updated.")
+        root.destroy()
+
+    tk.Button(root, text="Save", command=save_button).pack(pady=15)
+
+    root.mainloop()
+
+#===== SECTION 4: CHANGE IP END POINT =====
 
 
 #===== SECTION 5: TRANSFER TUNING START POINT =====
@@ -93,20 +165,29 @@ def file_is_stable(path: Path, stable_seconds: float) -> bool:
 
 
 #===== SECTION 8: REMOTE FILENAME BUILDING START POINT =====
-def build_remote_filename(local_path: Path) -> bytes:
+def build_remote_filename(local_path: Path, device_id: str) -> bytes:
     ts = time.strftime("%Y%m%d_%H%M%S")
-    return f"{DEVICE_ID}__{ts}__{local_path.name}".encode("utf-8")
+    return f"{device_id}__{ts}__{local_path.name}".encode("utf-8")
 #===== SECTION 8: REMOTE FILENAME BUILDING END POINT =====
 
 
 #===== SECTION 9: TCP SEND PROTOCOL START POINT =====
 def send_file(path: Path) -> None:
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE)
+
+    laptop_ip = config.get("NETWORK","LAPTOP_IP")
+    port = config.getint("NETWORK","PORT")
+
+    device_number = config.getint("DEVICE","DEVICE_NUM")
+    device_id = f"LIDAR_{device_number:02d}"
+
     file_size = path.stat().st_size
-    remote_name = build_remote_filename(path)
+    remote_name = build_remote_filename(path,device_id)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(CONNECT_TIMEOUT)
-        s.connect((LAPTOP_IP, PORT))
+        s.connect((laptop_ip, port))
 
         s.sendall(struct.pack("!I", len(remote_name)))
         s.sendall(remote_name)

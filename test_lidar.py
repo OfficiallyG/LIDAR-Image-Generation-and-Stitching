@@ -62,6 +62,9 @@ while True:
         if key == ord('q'):
             break
             
+        if key == ord('i'): #change IP,PORT, and device number on pi
+            sender.changeAddress()
+
         if key == ord('s'):
             matrix = ld[:,:3]
             vertices = np.array([tuple(row) for row in matrix.tolist()],
