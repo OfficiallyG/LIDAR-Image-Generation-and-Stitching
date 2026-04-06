@@ -35,11 +35,10 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QListWidget,
     QListWidgetItem,
-    QProgressBar,
-    QCheckBox,
     QFileDialog,
     QMessageBox,
-    QAbstractItemView
+    QAbstractItemView,
+    QCheckBox
 )
 #===== SECTION 1: IMPORTS END POINT =====
 
@@ -95,6 +94,14 @@ def recv_exact(conn: socket.socket, n: int) -> bytes:
         data += chunk
     return data
 #===== SECTION 3: TCP TRANSFER HELPERS END POINT =====
+
+class NullProgress:
+    #no-op progress helper so long operations can keep calling progress methods without showing a bar
+    def setRange(self, *args, **kwargs):
+        pass
+
+    def setValue(self, *args, **kwargs):
+        pass
 
 #===== SECTION 4: RECEIVER BACKGROUND THREAD START POINT =====
 class ReceiverWorker(QThread):
@@ -380,17 +387,24 @@ def _normalize_unit(values: np.ndarray) -> np.ndarray:
 
 
 def _smooth_gradient_colors(t: np.ndarray) -> np.ndarray:
-    #build smooth high-contrast rgb colors from 0..1 values
+    #use a perceptually smoother palette so rooms are easier to read on a dark background
+    #this is a viridis-style ramp: dark purple -> blue -> teal -> green -> yellow
     anchors = np.array([
-        [0.05, 0.05, 0.10],
-        [0.15, 0.35, 0.95],
-        [0.10, 0.80, 0.75],
-        [0.20, 0.95, 0.20],
-        [0.98, 0.90, 0.15],
-        [0.98, 0.35, 0.10],
-        [0.95, 0.15, 0.20],
+        [0.267, 0.005, 0.329],
+        [0.283, 0.141, 0.458],
+        [0.254, 0.265, 0.530],
+        [0.207, 0.372, 0.553],
+        [0.164, 0.471, 0.558],
+        [0.128, 0.567, 0.551],
+        [0.135, 0.659, 0.518],
+        [0.267, 0.749, 0.441],
+        [0.478, 0.821, 0.318],
+        [0.741, 0.873, 0.150],
+        [0.993, 0.906, 0.144],
     ], dtype=np.float32)
     t = np.clip(np.asarray(t, dtype=np.float32), 0.0, 1.0)
+    #slightly brighten the midrange so floor, desks, and walls separate more clearly
+    t = np.power(t, 0.85, dtype=np.float32)
     nseg = anchors.shape[0] - 1
     u = t * nseg
     i0 = np.floor(u).astype(np.int32)
@@ -400,11 +414,16 @@ def _smooth_gradient_colors(t: np.ndarray) -> np.ndarray:
     return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
 
 
-def voxel_downsample_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] = None, voxel_size: float = 0.05) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+def voxel_downsample_numpy(
+    xyz: np.ndarray,
+    rgb: Optional[np.ndarray] = None,
+    intensity: Optional[np.ndarray] = None,
+    voxel_size: float = 0.05,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     #merge nearby points into voxel centroids so scans render cleaner and faster
     xyz = np.asarray(xyz, dtype=np.float32)
     if xyz.size == 0:
-        return xyz, rgb
+        return xyz, rgb, intensity
     voxel_size = max(1e-4, float(voxel_size))
     mins = xyz.min(axis=0)
     keys = np.floor((xyz - mins) / voxel_size).astype(np.int32)
@@ -423,14 +442,26 @@ def voxel_downsample_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] = None, vo
             out_rgb[:, dim] = np.bincount(inverse, weights=rgbf[:, dim], minlength=len(uniq)) / counts
         out_rgb = np.clip(out_rgb, 0, 255).astype(np.uint8)
 
-    return out_xyz, out_rgb
+    out_intensity = None
+    if intensity is not None and len(intensity) == len(xyz):
+        intensityf = np.asarray(intensity, dtype=np.float32)
+        out_intensity = np.bincount(inverse, weights=intensityf, minlength=len(uniq)) / counts
+        out_intensity = out_intensity.astype(np.float32)
+
+    return out_xyz, out_rgb, out_intensity
 
 
-def statistical_outlier_filter_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] = None, k: int = 12, z_thresh: float = 1.2) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+def statistical_outlier_filter_numpy(
+    xyz: np.ndarray,
+    rgb: Optional[np.ndarray] = None,
+    intensity: Optional[np.ndarray] = None,
+    k: int = 12,
+    z_thresh: float = 1.2,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     #remove stray points using local neighbor distances without external deps
     xyz = np.asarray(xyz, dtype=np.float32)
     if len(xyz) <= max(8, k + 1):
-        return xyz, rgb
+        return xyz, rgb, intensity
 
     sample_cap = 2500
     if len(xyz) > sample_cap:
@@ -450,15 +481,215 @@ def statistical_outlier_filter_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] 
 
     out_xyz = xyz[keep]
     out_rgb = rgb[keep] if rgb is not None and len(rgb) == len(xyz) else None
-    return out_xyz, out_rgb
+    out_intensity = intensity[keep] if intensity is not None and len(intensity) == len(xyz) else None
+    return out_xyz, out_rgb, out_intensity
 
 
-def remove_ceiling_only_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+def _safe_take_optional(values: Optional[np.ndarray], keep: np.ndarray) -> Optional[np.ndarray]:
+    #slice an optional 1d channel only when it matches the point count
+    if values is None:
+        return None
+    values = np.asarray(values)
+    if len(values) != len(keep):
+        return None
+    return values[keep]
+
+
+def _normalize_vector(vec: np.ndarray) -> np.ndarray:
+    #return a unit-length copy of a vector
+    vec = np.asarray(vec, dtype=np.float64)
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-12:
+        raise ValueError("cannot normalize a near-zero vector")
+    return (vec / norm).astype(np.float64)
+
+
+def _rotation_matrix_from_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    #build the shortest-arc rotation that maps one direction vector onto another
+    a = _normalize_vector(source)
+    b = _normalize_vector(target)
+    v = np.cross(a, b)
+    c = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    s = float(np.linalg.norm(v))
+
+    if s < 1e-10:
+        if c > 0.0:
+            return np.eye(3, dtype=np.float64)
+
+        axis_guess = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(a[0]) > 0.9:
+            axis_guess = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+        axis = _normalize_vector(np.cross(a, axis_guess))
+        outer = np.outer(axis, axis)
+        return (-np.eye(3, dtype=np.float64) + 2.0 * outer).astype(np.float64)
+
+    vx = np.array([
+        [0.0, -v[2], v[1]],
+        [v[2], 0.0, -v[0]],
+        [-v[1], v[0], 0.0],
+    ], dtype=np.float64)
+    return (np.eye(3, dtype=np.float64) + vx + (vx @ vx) * ((1.0 - c) / (s * s))).astype(np.float64)
+
+
+def _rotation_matrix_about_z(theta_rad: float) -> np.ndarray:
+    #build a standard yaw rotation matrix around the z-axis
+    c = float(np.cos(theta_rad))
+    s = float(np.sin(theta_rad))
+    return np.array([
+        [c, -s, 0.0],
+        [s, c, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+
+
+def _apply_rotation(xyz: np.ndarray, rotation: np.ndarray) -> np.ndarray:
+    #rotate Nx3 points using a 3x3 rotation matrix
+    xyz = np.asarray(xyz, dtype=np.float32)
+    rotation = np.asarray(rotation, dtype=np.float64)
+    return (xyz.astype(np.float64) @ rotation.T).astype(np.float32)
+
+
+def _fit_plane_from_points(points: np.ndarray) -> Optional[Tuple[np.ndarray, float]]:
+    #solve ax+by+cz+d=0 for three sample points
+    if len(points) != 3:
+        return None
+    p0, p1, p2 = points
+    normal = np.cross(p1 - p0, p2 - p0)
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-8:
+        return None
+    normal = normal / norm
+    d = -float(np.dot(normal, p0))
+    return normal.astype(np.float64), d
+
+
+def _sample_for_ransac(xyz: np.ndarray, cap: int = 7000) -> np.ndarray:
+    #downsample the candidate pool for faster plane scoring while preserving broad coverage
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) <= cap:
+        return xyz
+    rng = np.random.default_rng(12345)
+    idx = rng.choice(len(xyz), size=cap, replace=False)
+    return xyz[np.sort(idx)]
+
+
+def _robust_axis_span(values: np.ndarray) -> float:
+    #measure a stable extent while ignoring extreme outliers
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return 0.0
+    lo = float(np.percentile(values, 5))
+    hi = float(np.percentile(values, 95))
+    return max(hi - lo, 0.0)
+
+
+def _score_plane_candidate(all_xyz: np.ndarray, normal: np.ndarray, d: float, threshold: float) -> Optional[Dict[str, Any]]:
+    #score a plane using full-cloud support, one-sided occupancy, and 2d floor-like spread
+    signed = all_xyz @ normal + d
+    distances = np.abs(signed)
+    inliers = distances <= threshold
+    inlier_count = int(inliers.sum())
+    if inlier_count < 80:
+        return None
+
+    inlier_xyz = all_xyz[inliers]
+    rotation = _rotation_matrix_from_vectors(normal, np.array([0.0, 0.0, 1.0], dtype=np.float64))
+    inlier_leveled = _apply_rotation(inlier_xyz, rotation)
+    span_x = _robust_axis_span(inlier_leveled[:, 0])
+    span_y = _robust_axis_span(inlier_leveled[:, 1])
+    plane_area = float(span_x * span_y)
+    if plane_area < 0.10:
+        return None
+
+    pos_ratio = float((signed > threshold).mean())
+    neg_ratio = float((signed < -threshold).mean())
+
+    oriented_normal = np.asarray(normal, dtype=np.float64)
+    oriented_d = float(d)
+    if neg_ratio > pos_ratio:
+        oriented_normal = -oriented_normal
+        oriented_d = -oriented_d
+        signed = -signed
+        pos_ratio, neg_ratio = neg_ratio, pos_ratio
+
+    one_sidedness = max(pos_ratio - neg_ratio, 0.0)
+
+    #weak tie-breaker only; does not drive the result by itself
+    z = all_xyz[:, 2]
+    raw_low = float(np.percentile(z, 10))
+    raw_high = float(np.percentile(z, 90))
+    raw_span = max(raw_high - raw_low, 1e-6)
+    inlier_z = float(np.median(inlier_xyz[:, 2]))
+    low_bias = 1.0 - np.clip((inlier_z - raw_low) / raw_span, 0.0, 1.0)
+
+    score = (inlier_count * 10.0) + (plane_area * 260.0) + (one_sidedness * 900.0) + (low_bias * 40.0)
+    return {
+        "normal": oriented_normal.astype(np.float64),
+        "d": oriented_d,
+        "threshold": threshold,
+        "subset_inlier_mask": inliers,
+        "subset_inlier_count": inlier_count,
+        "score": float(score),
+        "subset_xyz": all_xyz,
+        "plane_area": plane_area,
+        "one_sidedness": one_sidedness,
+    }
+
+
+def detect_floor_plane_ransac_numpy(xyz: np.ndarray, iterations: int = 1200, distance_threshold: Optional[float] = None) -> Dict[str, Any]:
+    #find the dominant room-base plane using full-cloud ransac instead of raw-z cropping
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) < 50:
+        raise ValueError("not enough points for floor detection")
+
+    sampled_xyz = _sample_for_ransac(xyz, cap=7000)
+    spans = np.percentile(sampled_xyz, 95, axis=0) - np.percentile(sampled_xyz, 5, axis=0)
+    span = float(max(np.max(spans), 1e-6))
+    threshold = float(distance_threshold) if distance_threshold is not None else float(np.clip(span / 120.0, 0.010, 0.045))
+
+    best = None
+    best_score = -1.0
+    rng = np.random.default_rng()
+
+    for _ in range(iterations):
+        sample_idx = rng.choice(len(sampled_xyz), size=3, replace=False)
+        fit = _fit_plane_from_points(sampled_xyz[sample_idx])
+        if fit is None:
+            continue
+        normal, d = fit
+        scored = _score_plane_candidate(sampled_xyz, normal, d, threshold)
+        if scored is None:
+            continue
+        if scored["score"] > best_score:
+            best_score = scored["score"]
+            best = scored
+
+    if best is None:
+        centered = sampled_xyz - sampled_xyz.mean(axis=0, keepdims=True)
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        normal = _normalize_vector(vh[-1])
+        d = -float(np.dot(normal, sampled_xyz.mean(axis=0)))
+        best = {
+            "normal": normal,
+            "d": d,
+            "threshold": threshold,
+            "subset_inlier_mask": np.ones(len(sampled_xyz), dtype=bool),
+            "subset_inlier_count": len(sampled_xyz),
+            "subset_xyz": sampled_xyz,
+            "score": 0.0,
+        }
+
+    return best
+
+
+def remove_ceiling_only_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] = None, intensity: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     #keep the room and floor intact, but trim only the highest ceiling band
     xyz = np.asarray(xyz, dtype=np.float32)
     if len(xyz) < 100:
         floor_ref = float(np.percentile(xyz[:, 2], 3)) if len(xyz) else 0.0
-        return xyz, rgb, xyz[:, 2] - floor_ref if len(xyz) else None
+        height = xyz[:, 2] - floor_ref if len(xyz) else None
+        return xyz, rgb, intensity, height
 
     z = xyz[:, 2]
     low_ref = float(np.percentile(z, 3))
@@ -469,19 +700,171 @@ def remove_ceiling_only_numpy(xyz: np.ndarray, rgb: Optional[np.ndarray] = None)
     high_cut = high_p - ceiling_margin
     keep = z <= high_cut
 
-    #if trim was too aggressive, back off to a lighter ceiling-only trim
     if keep.sum() < max(50, int(len(xyz) * 0.50)):
         high_cut = float(np.percentile(z, 98))
         keep = z <= high_cut
 
-    #if still too aggressive, keep original geometry
     if keep.sum() < max(50, int(len(xyz) * 0.50)):
-        return xyz, rgb, z - low_ref
+        return xyz, rgb, intensity, z - low_ref
 
     out_xyz = xyz[keep]
     out_rgb = rgb[keep] if rgb is not None and len(rgb) == len(xyz) else None
+    out_intensity = intensity[keep] if intensity is not None and len(intensity) == len(xyz) else None
     floor_ref = float(np.percentile(out_xyz[:, 2], 3))
-    return out_xyz, out_rgb, out_xyz[:, 2] - floor_ref
+    return out_xyz, out_rgb, out_intensity, out_xyz[:, 2] - floor_ref
+
+
+def detect_dominant_wall_yaw_numpy(xyz: np.ndarray) -> float:
+    #estimate the strongest room-wall heading from a leveled scan
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) < 50:
+        return 0.0
+
+    z = xyz[:, 2]
+    z_low = float(np.percentile(z, 20))
+    z_high = float(np.percentile(z, 80))
+    wall_band = xyz[(z >= z_low) & (z <= z_high)]
+    if len(wall_band) < 50:
+        wall_band = xyz
+
+    xy = wall_band[:, :2].astype(np.float64)
+    xy_centered = xy - xy.mean(axis=0, keepdims=True)
+
+    cov = np.cov(xy_centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    main_vec = eigvecs[:, int(np.argmax(eigvals))]
+    theta = float(np.arctan2(main_vec[1], main_vec[0]))
+
+    candidates = [theta, theta + np.pi / 2.0]
+    normalized_candidates = [((angle + np.pi / 4.0) % (np.pi / 2.0)) - np.pi / 4.0 for angle in candidates]
+    best_angle = min(normalized_candidates, key=lambda angle: abs(angle))
+    return float(best_angle)
+
+
+def _slice_plane_strength(xyz: np.ndarray, low_q: float, high_q: float) -> float:
+    #estimate how much of a broad horizontal plane exists inside a thin height slice
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) < 50:
+        return 0.0
+    z = xyz[:, 2]
+    z_low = float(np.percentile(z, low_q))
+    z_high = float(np.percentile(z, high_q))
+    slab = xyz[(z >= z_low) & (z <= z_high)]
+    if len(slab) < 25:
+        return 0.0
+    span_x = _robust_axis_span(slab[:, 0])
+    span_y = _robust_axis_span(slab[:, 1])
+    area = float(span_x * span_y)
+    density = float(len(slab))
+    return area * max(density, 1.0)
+
+
+def _vertical_density_balance(xyz: np.ndarray) -> Dict[str, float]:
+    #compare lower-room density to upper-room density so upside-down results can be detected from real room content
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) == 0:
+        return {"low": 0.0, "high": 0.0, "very_low": 0.0, "very_high": 0.0, "metric": 0.0}
+
+    z = xyz[:, 2]
+    z_lo = float(np.percentile(z, 2))
+    z_hi = float(np.percentile(z, 98))
+    span = max(z_hi - z_lo, 1e-6)
+    zn = np.clip((z - z_lo) / span, 0.0, 1.0)
+
+    low = float(np.sum((zn >= 0.00) & (zn <= 0.30)))
+    high = float(np.sum((zn >= 0.70) & (zn <= 1.00)))
+    very_low = float(np.sum(zn <= 0.12))
+    very_high = float(np.sum(zn >= 0.88))
+    metric = (low - high) + 0.5 * (very_low - very_high)
+    return {
+        "low": low,
+        "high": high,
+        "very_low": very_low,
+        "very_high": very_high,
+        "metric": float(metric),
+    }
+
+
+def should_flip_stabilized_scan_180(xyz: np.ndarray) -> bool:
+    #flip automatically when the stabilized room has more structure near the top than near the bottom
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) < 100:
+        return False
+
+    balance = _vertical_density_balance(xyz)
+    return bool(balance["metric"] < 0.0)
+
+
+def stabilize_scan_to_floor_frame_numpy(
+    xyz: np.ndarray,
+    rgb: Optional[np.ndarray] = None,
+    intensity: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    #anchor the scan to the detected floor, square it to the room, then force a 180-degree flip so the floor lands down
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) < 50:
+        floor_ref = float(np.percentile(xyz[:, 2], 3)) if len(xyz) else 0.0
+        return {
+            "xyz": xyz,
+            "rgb": rgb,
+            "intensity": intensity,
+            "height_from_floor": xyz[:, 2] - floor_ref if len(xyz) else np.zeros((0,), dtype=np.float32),
+            "floor_normal": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            "rotation_level": np.eye(3, dtype=np.float32),
+            "rotation_yaw": np.eye(3, dtype=np.float32),
+            "rotation_flip": np.eye(3, dtype=np.float32),
+            "floor_shift": 0.0,
+            "wall_yaw_rad": 0.0,
+            "auto_flipped": False,
+        }
+
+    floor_fit = detect_floor_plane_ransac_numpy(xyz)
+    floor_normal = floor_fit["normal"]
+    rotation_level = _rotation_matrix_from_vectors(floor_normal, np.array([0.0, 0.0, 1.0], dtype=np.float64))
+    leveled_xyz = _apply_rotation(xyz, rotation_level)
+
+    floor_subset_rotated = _apply_rotation(floor_fit["subset_xyz"], rotation_level)
+    subset_mask = floor_fit.get("subset_inlier_mask")
+    if subset_mask is not None and len(subset_mask) == len(floor_subset_rotated) and subset_mask.any():
+        floor_z = float(np.median(floor_subset_rotated[subset_mask, 2]))
+    else:
+        floor_z = float(np.percentile(leveled_xyz[:, 2], 3))
+    leveled_xyz[:, 2] -= floor_z
+
+    yaw_angle = detect_dominant_wall_yaw_numpy(leveled_xyz)
+    rotation_yaw = _rotation_matrix_about_z(-yaw_angle)
+    stabilized_xyz = _apply_rotation(leveled_xyz, rotation_yaw)
+
+    #always apply a 180-degree flip after leveling/yaw alignment so the result comes back floor-down
+    rotation_flip = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ], dtype=np.float64)
+    stabilized_xyz = _apply_rotation(stabilized_xyz, rotation_flip)
+    auto_flipped = True
+
+    floor_ref = float(np.percentile(stabilized_xyz[:, 2], 1))
+    stabilized_xyz[:, 2] -= floor_ref
+
+    xy_center = np.median(stabilized_xyz[:, :2], axis=0)
+    stabilized_xyz[:, 0] -= float(xy_center[0])
+    stabilized_xyz[:, 1] -= float(xy_center[1])
+
+    height_from_floor = stabilized_xyz[:, 2].astype(np.float32)
+    return {
+        "xyz": stabilized_xyz,
+        "rgb": rgb,
+        "intensity": intensity,
+        "height_from_floor": height_from_floor,
+        "floor_normal": floor_normal.astype(np.float32),
+        "rotation_level": rotation_level.astype(np.float32),
+        "rotation_yaw": rotation_yaw.astype(np.float32),
+        "rotation_flip": rotation_flip.astype(np.float32),
+        "floor_shift": float(floor_z),
+        "wall_yaw_rad": float(yaw_angle),
+        "auto_flipped": bool(auto_flipped),
+    }
 
 
 def build_edited_colors(xyz: np.ndarray, intensity: Optional[np.ndarray] = None, height_from_floor: Optional[np.ndarray] = None) -> np.ndarray:
@@ -503,8 +886,70 @@ def build_edited_colors(xyz: np.ndarray, intensity: Optional[np.ndarray] = None,
     return _smooth_gradient_colors(blend)
 
 
+def estimate_ceiling_cut_height(z_values: np.ndarray) -> Optional[float]:
+    #estimate the lower boundary of the densest high-z slab so ceiling points can be hidden or removed
+    z_values = np.asarray(z_values, dtype=np.float32)
+    if z_values.size < 100:
+        return None
+
+    z_low = float(np.percentile(z_values, 2))
+    z_high = float(np.percentile(z_values, 98))
+    span = max(z_high - z_low, 1e-6)
+    if span < 0.20:
+        return None
+
+    focus = z_values[z_values >= (z_low + 0.55 * span)]
+    if focus.size < 50:
+        return None
+
+    bins = int(np.clip(span / 0.05, 12, 40))
+    hist, edges = np.histogram(focus, bins=bins, range=(z_low + 0.55 * span, z_high))
+    if hist.size == 0 or int(hist.max()) < 10:
+        return None
+
+    peak = int(np.argmax(hist))
+    peak_height = int(hist[peak])
+    run_start = peak
+    run_end = peak
+    threshold = max(4, int(peak_height * 0.45))
+
+    while run_start > 0 and hist[run_start - 1] >= threshold:
+        run_start -= 1
+    while run_end < (len(hist) - 1) and hist[run_end + 1] >= threshold:
+        run_end += 1
+
+    cut_height = float(edges[run_start])
+    if cut_height <= (z_low + 0.45 * span):
+        cut_height = float(z_low + 0.82 * span)
+    return cut_height
+
+
+def remove_detected_ceiling_numpy(
+    xyz: np.ndarray,
+    rgb: Optional[np.ndarray] = None,
+    intensity: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
+    #remove only the detected ceiling slab while keeping walls and room contents intact
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) == 0:
+        return xyz, rgb, intensity, None
+
+    cut_height = estimate_ceiling_cut_height(xyz[:, 2])
+    if cut_height is None:
+        return xyz, rgb, intensity, None
+
+    keep = xyz[:, 2] < cut_height
+    if int(np.count_nonzero(keep)) < max(100, int(len(xyz) * 0.55)):
+        return xyz, rgb, intensity, None
+
+    out_xyz = xyz[keep]
+    out_rgb = rgb[keep] if rgb is not None and len(rgb) == len(xyz) else None
+    out_intensity = intensity[keep] if intensity is not None and len(intensity) == len(xyz) else None
+    return out_xyz, out_rgb, out_intensity, float(cut_height)
+
+
 def cleanup_scan_to_new_file(input_path: str) -> str:
-    #clean a scan, save an edited copy, and return the new file path
+    #clean a scan gently so room detail is preserved while obvious floaters are removed
     data = read_ply_data(input_path)
     xyz = data["xyz"]
     rgb = data.get("rgb")
@@ -517,21 +962,18 @@ def cleanup_scan_to_new_file(input_path: str) -> str:
     maxs = xyz.max(axis=0)
     span = np.maximum(maxs - mins, 1e-6)
     max_span = float(np.max(span))
-    voxel_size = float(np.clip(max_span / 220.0, 0.025, 0.120))
 
-    xyz, rgb = voxel_downsample_numpy(xyz, rgb, voxel_size=voxel_size)
-    xyz, rgb = statistical_outlier_filter_numpy(xyz, rgb, k=14, z_thresh=1.0)
-    xyz, rgb, height_from_floor = remove_ceiling_only_numpy(xyz, rgb)
+    #use a lighter downsample than before so desks, corners, and wall detail survive better
+    voxel_size = float(np.clip(max_span / 420.0, 0.010, 0.035))
+    intensity = None if intensity is None or len(intensity) != len(xyz) else np.asarray(intensity, dtype=np.float32)
 
-    #run one more lighter outlier pass after ceiling trimming
-    xyz, rgb = statistical_outlier_filter_numpy(xyz, rgb, k=10, z_thresh=0.95)
-    if len(xyz) > 0:
-        floor_ref = float(np.percentile(xyz[:, 2], 3))
-        height_from_floor = xyz[:, 2] - floor_ref
-        if intensity is not None and len(intensity) != len(xyz):
-            intensity = None
+    if len(xyz) > 120000:
+        xyz, rgb, intensity = voxel_downsample_numpy(xyz, rgb, intensity=intensity, voxel_size=voxel_size)
 
-    edited_rgb = build_height_colors_rgb(xyz)
+    #single lighter outlier pass so noise is reduced without chewing through good geometry
+    xyz, rgb, intensity = statistical_outlier_filter_numpy(xyz, rgb, intensity=intensity, k=10, z_thresh=1.8)
+
+    edited_rgb = build_edited_colors(xyz, intensity=intensity, height_from_floor=xyz[:, 2] if len(xyz) else None)
 
     src = Path(input_path)
     output_path = src.with_name(f"{src.stem}_edited{src.suffix}")
@@ -541,6 +983,117 @@ def cleanup_scan_to_new_file(input_path: str) -> str:
         counter += 1
 
     write_ply_xyzrgb_ascii(str(output_path), xyz, edited_rgb)
+    return str(output_path)
+
+
+def remove_ceiling_to_new_file(input_path: str) -> str:
+    #save a new scan file with the detected ceiling slab removed
+    data = read_ply_data(input_path)
+    xyz = data["xyz"]
+    intensity = data.get("intensity")
+
+    if xyz.size == 0:
+        raise ValueError("scan contains no points")
+
+    out_xyz, _, out_intensity, cut_height = remove_detected_ceiling_numpy(xyz, intensity=intensity)
+    if cut_height is None:
+        raise ValueError("could not detect a strong ceiling slab in this scan")
+
+    out_rgb = build_edited_colors(out_xyz, intensity=out_intensity, height_from_floor=out_xyz[:, 2] if len(out_xyz) else None)
+
+    src = Path(input_path)
+    output_path = src.with_name(f"{src.stem}_noceiling{src.suffix}")
+    counter = 1
+    while output_path.exists():
+        output_path = src.with_name(f"{src.stem}_noceiling_{counter}{src.suffix}")
+        counter += 1
+
+    write_ply_xyzrgb_ascii(str(output_path), out_xyz, out_rgb)
+    return str(output_path)
+
+
+def stabilize_floor_to_new_file(input_path: str) -> str:
+    #detect the floor plane on a lightly cleaned copy, then apply that stabilized transform back to the full scan
+    data = read_ply_data(input_path)
+    xyz = data["xyz"]
+    rgb = data.get("rgb")
+    intensity = data.get("intensity")
+
+    if xyz.size == 0:
+        raise ValueError("scan contains no points")
+
+    mins = xyz.min(axis=0)
+    maxs = xyz.max(axis=0)
+    span = np.maximum(maxs - mins, 1e-6)
+    max_span = float(np.max(span))
+    floor_voxel = float(np.clip(max_span / 220.0, 0.030, 0.120))
+
+    work_xyz, work_rgb, work_intensity = voxel_downsample_numpy(xyz, rgb, intensity=intensity, voxel_size=floor_voxel)
+    work_xyz, work_rgb, work_intensity = statistical_outlier_filter_numpy(work_xyz, work_rgb, intensity=work_intensity, k=14, z_thresh=1.1)
+
+    stabilized = stabilize_scan_to_floor_frame_numpy(work_xyz, rgb=work_rgb, intensity=work_intensity)
+    level_rotation = np.asarray(stabilized["rotation_level"], dtype=np.float64)
+    yaw_rotation = np.asarray(stabilized["rotation_yaw"], dtype=np.float64)
+    flip_rotation = np.asarray(stabilized["rotation_flip"], dtype=np.float64)
+    combined_rotation = flip_rotation @ yaw_rotation @ level_rotation
+
+    out_xyz = _apply_rotation(xyz, combined_rotation)
+    if len(out_xyz) > 0:
+        floor_ref = float(np.percentile(out_xyz[:, 2], 1))
+        out_xyz[:, 2] -= floor_ref
+        xy_center = np.median(out_xyz[:, :2], axis=0)
+        out_xyz[:, 0] -= float(xy_center[0])
+        out_xyz[:, 1] -= float(xy_center[1])
+
+    out_rgb = build_edited_colors(
+        out_xyz,
+        intensity=intensity,
+        height_from_floor=out_xyz[:, 2] if len(out_xyz) else None,
+    )
+
+    src = Path(input_path)
+    output_path = src.with_name(f"{src.stem}_floored{src.suffix}")
+    counter = 1
+    while output_path.exists():
+        output_path = src.with_name(f"{src.stem}_floored_{counter}{src.suffix}")
+        counter += 1
+
+    write_ply_xyzrgb_ascii(str(output_path), out_xyz, out_rgb)
+    return str(output_path)
+
+
+def flip_scan_180_to_new_file(input_path: str) -> str:
+    #flip a leveled scan upside down by rotating 180 degrees about the x-axis
+    data = read_ply_data(input_path)
+    xyz = data["xyz"]
+    intensity = data.get("intensity")
+
+    if xyz.size == 0:
+        raise ValueError("scan contains no points")
+
+    rotation_flip = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ], dtype=np.float64)
+    out_xyz = _apply_rotation(xyz, rotation_flip)
+    if len(out_xyz) > 0:
+        floor_ref = float(np.percentile(out_xyz[:, 2], 3))
+        out_xyz[:, 2] -= floor_ref
+        xy_center = np.median(out_xyz[:, :2], axis=0)
+        out_xyz[:, 0] -= float(xy_center[0])
+        out_xyz[:, 1] -= float(xy_center[1])
+
+    out_rgb = build_edited_colors(out_xyz, intensity=intensity, height_from_floor=out_xyz[:, 2] if len(out_xyz) else None)
+
+    src = Path(input_path)
+    output_path = src.with_name(f"{src.stem}_flip180{src.suffix}")
+    counter = 1
+    while output_path.exists():
+        output_path = src.with_name(f"{src.stem}_flip180_{counter}{src.suffix}")
+        counter += 1
+
+    write_ply_xyzrgb_ascii(str(output_path), out_xyz, out_rgb)
     return str(output_path)
 #===== SECTION 5: PLY LOADING HELPERS END POINT =====
 
@@ -689,6 +1242,98 @@ class StitchWorker(QThread):
             self.error.emit(f"[stitch] failed: {e}")
 #===== SECTION 5B: STITCHING HELPERS END POINT =====
 
+def build_dark_app_stylesheet() -> str:
+    #dark ui theme so controls match the black viewer background
+    return """
+    QWidget {
+        background-color: #121212;
+        color: #e8e8e8;
+        font-size: 10pt;
+    }
+    QMainWindow, QWidget#centralWidget {
+        background-color: #121212;
+    }
+    QGroupBox {
+        border: 1px solid #3a3a3a;
+        border-radius: 6px;
+        margin-top: 10px;
+        padding-top: 10px;
+        font-weight: bold;
+        background-color: #171717;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        left: 10px;
+        padding: 0 4px;
+        color: #f0f0f0;
+    }
+    QPushButton {
+        background-color: #232323;
+        border: 1px solid #444444;
+        border-radius: 5px;
+        padding: 6px 10px;
+        color: #f0f0f0;
+    }
+    QPushButton:hover {
+        background-color: #2d2d2d;
+        border: 1px solid #5a5a5a;
+    }
+    QPushButton:pressed {
+        background-color: #1b1b1b;
+    }
+    QPushButton:disabled {
+        color: #8c8c8c;
+        background-color: #1a1a1a;
+        border: 1px solid #303030;
+    }
+    QListWidget, QLabel {
+        background-color: transparent;
+    }
+    QListWidget {
+        background-color: #171717;
+        border: 1px solid #383838;
+        border-radius: 6px;
+    }
+    QListWidget::item {
+        padding: 4px;
+    }
+    QListWidget::item:selected {
+        background-color: #21436b;
+        color: #ffffff;
+        border-radius: 4px;
+    }
+    QProgressBar {
+        background-color: #171717;
+        border: 1px solid #383838;
+        border-radius: 5px;
+        text-align: center;
+        color: #f0f0f0;
+    }
+    QProgressBar::chunk {
+        background-color: #3d8bfd;
+        border-radius: 4px;
+    }
+    QCheckBox {
+        spacing: 8px;
+    }
+    QCheckBox::indicator {
+        width: 14px;
+        height: 14px;
+    }
+    QCheckBox::indicator:unchecked {
+        border: 1px solid #5a5a5a;
+        background: #171717;
+    }
+    QCheckBox::indicator:checked {
+        border: 1px solid #3d8bfd;
+        background: #3d8bfd;
+    }
+    QMessageBox {
+        background-color: #121212;
+    }
+    """
+
+
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) START POINT =====
 class SinglePLYViewport(QWidget):
     def __init__(self, parent=None):
@@ -702,7 +1347,7 @@ class SinglePLYViewport(QWidget):
         self.view = gl.GLViewWidget()
         self.view.setCameraPosition(distance=85, elevation=18, azimuth=45)
 
-        #make background white for better contrast in screenshots
+        #keep a dark viewport background for stronger point-cloud contrast
         try:
             self.view.setBackgroundColor("k")
         except Exception:
@@ -715,11 +1360,56 @@ class SinglePLYViewport(QWidget):
         self.point_cloud_item.setGLOptions("opaque")
         self.view.addItem(self.point_cloud_item)
 
-        #track if anything is loaded
+        #track loaded point-cloud state so viewer-only filters can be toggled on and off
         self.file_loaded = False
+        self._raw_pos = np.zeros((0, 3), dtype=np.float32)
+        self._raw_color = np.zeros((0, 4), dtype=np.float32)
+        self._fit_scale = 1.0
+        self._display_distance = 25.0
+        self.hide_ceiling_enabled = False
+        self._ceiling_cut_height = None
+
+    def _refresh_display(self):
+        #redraw the viewer using the current hide-ceiling toggle without touching the underlying file
+        if len(self._raw_pos) == 0:
+            self.point_cloud_item.setData(pos=np.zeros((0, 3), dtype=np.float32))
+            self.file_loaded = False
+            return
+
+        pos = self._raw_pos
+        color = self._raw_color
+        if self.hide_ceiling_enabled and self._ceiling_cut_height is not None:
+            keep = pos[:, 2] < float(self._ceiling_cut_height)
+            if int(np.count_nonzero(keep)) >= max(100, int(len(pos) * 0.55)):
+                pos = pos[keep]
+                color = color[keep]
+
+        mins = pos.min(axis=0)
+        maxs = pos.max(axis=0)
+        center = (mins + maxs) / 2.0
+        pos_local = (pos - center) * self._fit_scale
+
+        self.point_cloud_item.setData(
+            pos=pos_local.astype(np.float32),
+            color=color.astype(np.float32),
+            size=3.5,
+            pxMode=True
+        )
+        self.point_cloud_item.setGLOptions("opaque")
+        self.file_loaded = True
+        self.view.setCameraPosition(distance=self._display_distance, elevation=18, azimuth=45)
+
+    def set_hide_ceiling(self, enabled: bool):
+        #toggle viewer-only ceiling hiding for the currently loaded scan
+        self.hide_ceiling_enabled = bool(enabled)
+        self._refresh_display()
 
     def clear_view(self):
         #wipe the current point cloud from the viewer
+        self._raw_pos = np.zeros((0, 3), dtype=np.float32)
+        self._raw_color = np.zeros((0, 4), dtype=np.float32)
+        self._ceiling_cut_height = None
+        self.hide_ceiling_enabled = False
         self.point_cloud_item.setData(pos=np.zeros((0, 3), dtype=np.float32))
         self.file_loaded = False
 
@@ -730,27 +1420,14 @@ class SinglePLYViewport(QWidget):
         if pos.size == 0:
             raise ValueError("ply contains no vertices")
 
-        mins = pos.min(axis=0)
-        maxs = pos.max(axis=0)
-        center = (mins + maxs) / 2.0
-        span = maxs - mins
+        span = pos.max(axis=0) - pos.min(axis=0)
         max_span = float(np.max(span)) if float(np.max(span)) > 0 else 1.0
-        fit_scale = 25.0 / max_span
-        pos_local = (pos - center) * fit_scale
-
-        color = build_height_colors_rgba(pos)
-
-        self.point_cloud_item.setData(
-            pos=pos_local.astype(np.float32),
-            color=color.astype(np.float32),
-            size=3.5,
-            pxMode=True
-        )
-        self.point_cloud_item.setGLOptions("opaque")
-        self.file_loaded = True
-
-        distance = max(25.0, max_span * fit_scale * 2.5)
-        self.view.setCameraPosition(distance=distance, elevation=18, azimuth=45)
+        self._fit_scale = 25.0 / max_span
+        self._display_distance = max(25.0, max_span * self._fit_scale * 2.5)
+        self._raw_pos = pos.astype(np.float32)
+        self._raw_color = build_height_colors_rgba(pos).astype(np.float32)
+        self._ceiling_cut_height = estimate_ceiling_cut_height(pos[:, 2])
+        self._refresh_display()
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) END POINT =====
 
 #===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) START POINT =====
@@ -764,9 +1441,11 @@ class LidarWindow(QMainWindow):
         self._closing = False
         self.current_loaded_path: Optional[str] = None
         self.stitch_worker: Optional[StitchWorker] = None
+        self.hide_ceiling_enabled = False
 
         #===== SECTION 8: UI CREATION START POINT =====
         self._build_ui()
+        self.setStyleSheet(build_dark_app_stylesheet())
         #===== SECTION 8: UI CREATION END POINT =====
 
         #===== SECTION 9: UI SIGNAL WIRING START POINT =====
@@ -855,8 +1534,6 @@ class LidarWindow(QMainWindow):
         self._add_queue_item(filename, saved_path)
         self._log(f"received -> Desktop/LiDAR_Inbox: {filename}")
 
-        if self.auto_load_chk.isChecked():
-            self._load_path_into_viewer(saved_path)
 
 
     def _add_queue_item(self, display_name: str, actual_path: str):
@@ -884,6 +1561,51 @@ class LidarWindow(QMainWindow):
         finally:
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
+
+    def _stabilize_floor_clicked(self):
+        #create a new leveled file with the detected floor placed at the bottom
+        if not self.current_loaded_path or not os.path.exists(self.current_loaded_path):
+            self._log("flooring failed: load a scan first.")
+            return
+
+        try:
+            self.progress.setRange(0, 0)
+            self._log(f"stabilizing floor: {os.path.basename(self.current_loaded_path)}")
+            floored_path = stabilize_floor_to_new_file(self.current_loaded_path)
+            display_name = f"{Path(floored_path).stem.replace('_floored', ' (floored)', 1)}{Path(floored_path).suffix}"
+            self._add_queue_item(display_name, floored_path)
+            self._log(f"floored scan saved: {os.path.basename(floored_path)}")
+            self._load_path_into_viewer(floored_path)
+        except Exception as e:
+            self._log(f"flooring failed: {e}")
+        finally:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+
+    def _flip_180_clicked(self):
+        #flip the currently loaded scan so a ceiling-picked floor result can be inverted quickly
+        if not self.current_loaded_path or not os.path.exists(self.current_loaded_path):
+            self._log("flip failed: load a scan first.")
+            return
+
+        try:
+            self.progress.setRange(0, 0)
+            self._log(f"flipping scan 180°: {os.path.basename(self.current_loaded_path)}")
+            flipped_path = flip_scan_180_to_new_file(self.current_loaded_path)
+            display_name = f"{Path(flipped_path).stem.replace('_flip180', ' (flip180)', 1)}{Path(flipped_path).suffix}"
+            self._add_queue_item(display_name, flipped_path)
+            self._log(f"flipped scan saved: {os.path.basename(flipped_path)}")
+            self._load_path_into_viewer(flipped_path)
+        except Exception as e:
+            self._log(f"flip failed: {e}")
+        finally:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+
+    def _hide_ceiling_toggled(self, checked: bool):
+        #toggle viewer-only hiding of the detected ceiling slab
+        self.viewer3d.set_hide_ceiling(bool(checked))
+        self._log("viewer ceiling hidden." if checked else "viewer ceiling shown.")
 
     def _build_ui(self):
         #===== SECTION 12: UI LAYOUT START POINT =====
@@ -920,6 +1642,7 @@ class LidarWindow(QMainWindow):
         left.addWidget(QLabel("Scans Queue"))
         self.scan_list = QListWidget()
         self.scan_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.scan_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left.addWidget(self.scan_list, 1)
 
         file_btn_row = QHBoxLayout()
@@ -928,10 +1651,6 @@ class LidarWindow(QMainWindow):
         file_btn_row.addWidget(self.btn_import_local)
         file_btn_row.addWidget(self.btn_delete)
         left.addLayout(file_btn_row)
-
-        self.auto_load_chk = QCheckBox("Auto-load after import/receive")
-        self.auto_load_chk.setChecked(True)
-        left.addWidget(self.auto_load_chk)
 
         self.btn_stitch = QPushButton("Stitch")
         left.addWidget(self.btn_stitch)
@@ -961,23 +1680,26 @@ class LidarWindow(QMainWindow):
         render_layout = QVBoxLayout(render_group)
 
         self.btn_clear_view = QPushButton("Clear Viewer")
+        self.btn_floor_scan = QPushButton("Stabilize Floor")
+        self.btn_flip_180 = QPushButton("Flip 180°")
         self.btn_cleanup_scan = QPushButton("Clean Up Scan")
+        self.hide_ceiling_chk = QCheckBox("Hide ceiling in viewer")
         render_layout.addWidget(self.btn_clear_view)
+        render_layout.addWidget(self.btn_floor_scan)
+        render_layout.addWidget(self.btn_flip_180)
         render_layout.addWidget(self.btn_cleanup_scan)
+        render_layout.addWidget(self.hide_ceiling_chk)
         self.right_layout.addWidget(render_group)
 
         info_group = QGroupBox("File Info")
         info_layout = QVBoxLayout(info_group)
         self.info_lbl = QLabel("No file loaded.")
-        self.info_lbl.setFixedSize(250, 30)
+        self.info_lbl.setFixedSize(250, 34)
         self.info_lbl.setWordWrap(True)
         info_layout.addWidget(self.info_lbl)
         self.right_layout.addWidget(info_group)
 
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.right_layout.addWidget(self.progress)
+        self.progress = NullProgress()
 
         self.right_layout.addWidget(QLabel("Log"))
         self.log_lbl = QLabel("")
@@ -985,7 +1707,7 @@ class LidarWindow(QMainWindow):
         self.log_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.log_lbl.setMinimumHeight(140)
         self.log_lbl.setFixedWidth(280)
-        self.log_lbl.setStyleSheet("border: 1px solid #999; padding: 8px;")
+        self.log_lbl.setStyleSheet("border: 1px solid #3a3a3a; background: #171717; padding: 8px; border-radius: 6px;")
         self.right_layout.addWidget(self.log_lbl, 1)
         #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
         #===== SECTION 12: UI LAYOUT END POINT =====
@@ -996,7 +1718,10 @@ class LidarWindow(QMainWindow):
         self.btn_delete.clicked.connect(self._delete_selected_clicked)
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_viewer)
         self.btn_clear_view.clicked.connect(self._clear_view_clicked)
+        self.btn_floor_scan.clicked.connect(self._stabilize_floor_clicked)
+        self.btn_flip_180.clicked.connect(self._flip_180_clicked)
         self.btn_cleanup_scan.clicked.connect(self._cleanup_scan_clicked)
+        self.hide_ceiling_chk.toggled.connect(self._hide_ceiling_toggled)
         self.btn_stitch.clicked.connect(self._stitch_clicked)
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
 
@@ -1065,6 +1790,9 @@ class LidarWindow(QMainWindow):
 
     def _clear_view_clicked(self):
         self.viewer3d.clear_view()
+        self.hide_ceiling_chk.blockSignals(True)
+        self.hide_ceiling_chk.setChecked(False)
+        self.hide_ceiling_chk.blockSignals(False)
         self.current_loaded_path = None
         self.info_lbl.setText("No file loaded.")
         self._log("cleared viewer.")
@@ -1086,8 +1814,6 @@ class LidarWindow(QMainWindow):
             self._add_queue_item(filename, path)
             self._log(f"imported local file: {filename}")
 
-        if self.auto_load_chk.isChecked() and file_paths:
-            self._load_path_into_viewer(file_paths[-1])
 
     def _load_item_into_viewer(self, item: QListWidgetItem):
         #double-clicking a queued file loads it into the viewer
