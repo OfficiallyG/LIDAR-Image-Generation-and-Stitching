@@ -65,7 +65,7 @@ def changeAddress():
     #create ip changer GUI and entry boxes
     root = tk.Tk()
     root.title("Network and Device Settings")
-    root.geometry("300x150")
+    root.geometry("300x300")
 
     tk.Label(root,text="New IP:").pack(pady=(10,0))
     ip_entry = tk.Entry(root)
@@ -110,7 +110,6 @@ def changeAddress():
         root.destroy()
 
     tk.Button(root, text="Save", command=save_button).pack(pady=15)
-
     root.mainloop()
 
 #===== SECTION 4: CHANGE IP END POINT =====
@@ -176,7 +175,7 @@ def send_file(path: Path) -> None:
     config = configparser.ConfigParser()
     config.read(CONFIG_FILE)
 
-    laptop_ip = config.get("NETWORK","LAPTOP_IP")
+    laptop_ip = config.get("NETWORK","LAPTOP_IP").strip()
     port = config.getint("NETWORK","PORT")
 
     device_number = config.getint("DEVICE","DEVICE_NUM")
