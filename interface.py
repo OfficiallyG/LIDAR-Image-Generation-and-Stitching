@@ -41,7 +41,8 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QAbstractItemView,
-    QCheckBox
+    QCheckBox,
+    QSizePolicy
 )
 #===== SECTION 1: IMPORTS END POINT =====
 
@@ -1720,9 +1721,12 @@ class LidarWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         main_layout = QHBoxLayout(root)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
 
         #===== SECTION 13: LEFT COLUMN (QUEUE + STATUS) START POINT =====
         left = QVBoxLayout()
+        left.setSpacing(8)
         main_layout.addLayout(left, 1)
 
         status_row = QHBoxLayout()
@@ -1769,7 +1773,8 @@ class LidarWindow(QMainWindow):
 
         #===== SECTION 14: CENTER COLUMN (3D VIEW) START POINT =====
         center = QVBoxLayout()
-        main_layout.addLayout(center, 3)
+        center.setSpacing(8)
+        main_layout.addLayout(center, 4)
 
         self.viewer3d = SinglePLYViewport()
         center.addWidget(self.viewer3d, 1)
@@ -1779,10 +1784,15 @@ class LidarWindow(QMainWindow):
         #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) START POINT =====
         self.right_panel = QWidget()
         self.right_layout = QVBoxLayout(self.right_panel)
-        main_layout.addWidget(self.right_panel, 1)
+        self.right_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_layout.setSpacing(10)
+        main_layout.addWidget(self.right_panel, 2)
 
         render_group = QGroupBox("Render Controls")
-        render_layout = QVBoxLayout(render_group)
+        render_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        render_layout = QGridLayout(render_group)
+        render_layout.setHorizontalSpacing(8)
+        render_layout.setVerticalSpacing(8)
 
         self.btn_clear_view = QPushButton("Clear Viewer")
         self.btn_floor_scan = QPushButton("Stabilize Floor")
@@ -1793,47 +1803,81 @@ class LidarWindow(QMainWindow):
         self.btn_right_view = QPushButton("Right Side View")
         self.btn_bottom_view = QPushButton("Bottom View")
         self.hide_ceiling_chk = QCheckBox("Hide ceiling in viewer")
-        render_layout.addWidget(self.btn_clear_view)
-        render_layout.addWidget(self.btn_floor_scan)
-        render_layout.addWidget(self.btn_flip_180)
-        render_layout.addWidget(self.btn_cleanup_scan)
-        render_layout.addWidget(self.hide_ceiling_chk)
-        self.right_layout.addWidget(render_group)
+
+        right_buttons = [
+            self.btn_clear_view,
+            self.btn_floor_scan,
+            self.btn_flip_180,
+            self.btn_cleanup_scan,
+            self.btn_top_view,
+            self.btn_left_view,
+            self.btn_right_view,
+            self.btn_bottom_view,
+        ]
+        for btn in right_buttons:
+            btn.setMinimumHeight(36)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        render_layout.addWidget(self.btn_clear_view, 0, 0)
+        render_layout.addWidget(self.btn_floor_scan, 0, 1)
+        render_layout.addWidget(self.btn_flip_180, 1, 0)
+        render_layout.addWidget(self.btn_cleanup_scan, 1, 1)
+        render_layout.addWidget(self.hide_ceiling_chk, 2, 0, 1, 2)
+        render_layout.setColumnStretch(0, 1)
+        render_layout.setColumnStretch(1, 1)
+        self.right_layout.addWidget(render_group, 0)
 
         info_group = QGroupBox("File Info")
+        info_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         info_layout = QVBoxLayout(info_group)
         self.info_lbl = QLabel("No file loaded.")
-        self.info_lbl.setFixedSize(250, 34)
+        self.info_lbl.setMinimumHeight(42)
+        self.info_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.info_lbl.setWordWrap(True)
         info_layout.addWidget(self.info_lbl)
-        self.right_layout.addWidget(info_group)
+        self.right_layout.addWidget(info_group, 0)
 
         self.progress = NullProgress()
 
-        self.right_layout.addWidget(QLabel("Log"))
+        log_title = QLabel("Log")
+        log_title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self.right_layout.addWidget(log_title, 0)
+
         self.log_lbl = QLabel("")
         self.log_lbl.setWordWrap(True)
         self.log_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.log_lbl.setMinimumHeight(140)
+        self.log_lbl.setMinimumHeight(180)
+        self.log_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.log_lbl.setStyleSheet("border: 1px solid #3a3a3a; background: #171717; padding: 8px; border-radius: 6px;")
         self.right_layout.addWidget(self.log_lbl, 1)
 
         viewer_group = QGroupBox("Viewer Buttons")
-        viewer_layout = QVBoxLayout(viewer_group)
-        viewer_layout.addWidget(self.btn_top_view)
-        viewer_layout.addWidget(self.btn_left_view)
-        viewer_layout.addWidget(self.btn_right_view)
-        viewer_layout.addWidget(self.btn_bottom_view)
-        self.right_layout.addWidget(viewer_group)
+        viewer_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        viewer_layout = QGridLayout(viewer_group)
+        viewer_layout.setHorizontalSpacing(8)
+        viewer_layout.setVerticalSpacing(8)
+        viewer_layout.addWidget(self.btn_top_view, 0, 0)
+        viewer_layout.addWidget(self.btn_left_view, 0, 1)
+        viewer_layout.addWidget(self.btn_right_view, 1, 0)
+        viewer_layout.addWidget(self.btn_bottom_view, 1, 1)
+        viewer_layout.setColumnStretch(0, 1)
+        viewer_layout.setColumnStretch(1, 1)
+        self.right_layout.addWidget(viewer_group, 0)
 
         bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(0, 0, 0, 0)
         bottom_row.addStretch(1)
         self.point_count_lbl = QLabel("Point Counter: 0")
         self.point_count_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.point_count_lbl.setStyleSheet("font-weight: bold; padding: 4px 2px;")
+        self.point_count_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self.point_count_lbl.setStyleSheet("font-weight: bold; padding: 6px 2px;")
         bottom_row.addWidget(self.point_count_lbl)
         bottom_row.addStretch(1)
         self.right_layout.addLayout(bottom_row)
+
+        main_layout.setStretch(0, 1)
+        main_layout.setStretch(1, 4)
+        main_layout.setStretch(2, 2)
         #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
         #===== SECTION 12: UI LAYOUT END POINT =====
 
@@ -1854,7 +1898,7 @@ class LidarWindow(QMainWindow):
         self.btn_stitch.clicked.connect(self._stitch_clicked)
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
         self.viewer3d.point_count_changed.connect(self._update_point_count_label)
-
+        #===== SECTION 16: UI EVENTS END POINT =====
 
     def _get_selected_queue_paths(self) -> List[str]:
         #return valid file paths for all currently selected queue items
@@ -1985,8 +2029,6 @@ class LidarWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
-#===== SECTION 16: UI EVENTS END POINT =====
-
 #===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) END POINT =====
 
 #===== SECTION 17: APP ENTRYPOINT START POINT =====
