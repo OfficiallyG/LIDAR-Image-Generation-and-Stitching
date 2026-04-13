@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QWidget,
     QHBoxLayout,
     QVBoxLayout,
+    QGridLayout,
     QGroupBox,
     QLabel,
     QPushButton,
@@ -1362,6 +1363,8 @@ def build_dark_app_stylesheet() -> str:
 
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) START POINT =====
 class SinglePLYViewport(QWidget):
+    point_count_changed = pyqtSignal(int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -1386,6 +1389,11 @@ class SinglePLYViewport(QWidget):
         self.point_cloud_item.setGLOptions("opaque")
         self.view.addItem(self.point_cloud_item)
 
+        #floor plane that sits under the visible cloud
+        self.floor_plane_item = gl.GLGridItem()
+        self.floor_plane_item.setSpacing(x=1.0, y=1.0)
+        self.view.addItem(self.floor_plane_item)
+
         #track loaded point-cloud state so viewer-only filters can be toggled on and off
         self.file_loaded = False
         self._raw_pos = np.zeros((0, 3), dtype=np.float32)
@@ -1395,11 +1403,38 @@ class SinglePLYViewport(QWidget):
         self.hide_ceiling_enabled = False
         self._ceiling_cut_height = None
 
+    def _update_floor_plane(self, pos_local: np.ndarray):
+        #resize and place the floor plane so the cloud appears to sit on top of it
+        if len(pos_local) == 0:
+            self.floor_plane_item.resetTransform()
+            self.floor_plane_item.setSize(x=1.0, y=1.0)
+            return
+
+        mins = pos_local.min(axis=0)
+        maxs = pos_local.max(axis=0)
+
+        span_x = max(float(maxs[0] - mins[0]), 4.0)
+        span_y = max(float(maxs[1] - mins[1]), 4.0)
+        floor_z = float(mins[2]) - 0.02
+
+        center_x = float((mins[0] + maxs[0]) / 2.0)
+        center_y = float((mins[1] + maxs[1]) / 2.0)
+
+        self.floor_plane_item.resetTransform()
+        self.floor_plane_item.setSize(x=span_x * 1.15, y=span_y * 1.15)
+
+        spacing = max(min(span_x, span_y) / 20.0, 0.5)
+        self.floor_plane_item.setSpacing(x=spacing, y=spacing)
+        self.floor_plane_item.translate(center_x, center_y, floor_z)
+
     def _refresh_display(self):
         #redraw the viewer using the current hide-ceiling toggle without touching the underlying file
         if len(self._raw_pos) == 0:
             self.point_cloud_item.setData(pos=np.zeros((0, 3), dtype=np.float32))
+            self.floor_plane_item.resetTransform()
+            self.floor_plane_item.setSize(x=1.0, y=1.0)
             self.file_loaded = False
+            self.point_count_changed.emit(0)
             return
 
         pos = self._raw_pos
@@ -1422,13 +1457,32 @@ class SinglePLYViewport(QWidget):
             pxMode=True
         )
         self.point_cloud_item.setGLOptions("opaque")
+        self._update_floor_plane(pos_local)
+
         self.file_loaded = True
         self.view.setCameraPosition(distance=self._display_distance, elevation=18, azimuth=45)
+        self.point_count_changed.emit(int(len(pos)))
 
     def set_hide_ceiling(self, enabled: bool):
         #toggle viewer-only ceiling hiding for the currently loaded scan
         self.hide_ceiling_enabled = bool(enabled)
         self._refresh_display()
+
+    def set_top_view(self):
+        #snap camera to a straight top-down view
+        self.view.setCameraPosition(distance=self._display_distance, elevation=90, azimuth=0)
+
+    def set_left_view(self):
+        #snap camera to the left side of the scan
+        self.view.setCameraPosition(distance=self._display_distance, elevation=0, azimuth=180)
+
+    def set_right_view(self):
+        #snap camera to the right side of the scan
+        self.view.setCameraPosition(distance=self._display_distance, elevation=0, azimuth=0)
+
+    def set_bottom_view(self):
+        #snap camera to a straight bottom-up view
+        self.view.setCameraPosition(distance=self._display_distance, elevation=-90, azimuth=0)
 
     def clear_view(self):
         #wipe the current point cloud from the viewer
@@ -1437,7 +1491,10 @@ class SinglePLYViewport(QWidget):
         self._ceiling_cut_height = None
         self.hide_ceiling_enabled = False
         self.point_cloud_item.setData(pos=np.zeros((0, 3), dtype=np.float32))
+        self.floor_plane_item.resetTransform()
+        self.floor_plane_item.setSize(x=1.0, y=1.0)
         self.file_loaded = False
+        self.point_count_changed.emit(0)
 
     def load_ply(self, path: str):
         #load one ply, fit it into view, and replace the current scan
@@ -1454,6 +1511,7 @@ class SinglePLYViewport(QWidget):
         self._raw_color = build_height_colors_rgba(pos).astype(np.float32)
         self._ceiling_cut_height = estimate_ceiling_cut_height(pos[:, 2])
         self._refresh_display()
+
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) END POINT =====
 
 #===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) START POINT =====
@@ -1531,6 +1589,10 @@ class LidarWindow(QMainWindow):
         #shows the laptop ip so the pi operator can type it into sender config
         ip = get_local_ip()
         self.ip_value_lbl.setText(f"{ip}:{RECV_PORT}")
+
+    def _update_point_count_label(self, count: int):
+        #show the current displayed point count in the lower-right corner
+        self.point_count_lbl.setText(f"Point Counter: {int(count):,}")
 
     def _on_receiver_error(self, msg: str):
         #surface receiver errors in the ui log
@@ -1633,6 +1695,26 @@ class LidarWindow(QMainWindow):
         self.viewer3d.set_hide_ceiling(bool(checked))
         self._log("viewer ceiling hidden." if checked else "viewer ceiling shown.")
 
+    def _top_view_clicked(self):
+        #switch the viewer camera to the top view
+        self.viewer3d.set_top_view()
+        self._log("camera set to top view.")
+
+    def _left_view_clicked(self):
+        #switch the viewer camera to the left side view
+        self.viewer3d.set_left_view()
+        self._log("camera set to left side view.")
+
+    def _right_view_clicked(self):
+        #switch the viewer camera to the right side view
+        self.viewer3d.set_right_view()
+        self._log("camera set to right side view.")
+
+    def _bottom_view_clicked(self):
+        #switch the viewer camera to the bottom view
+        self.viewer3d.set_bottom_view()
+        self._log("camera set to bottom view.")
+
     def _build_ui(self):
         #===== SECTION 12: UI LAYOUT START POINT =====
         root = QWidget()
@@ -1706,6 +1788,10 @@ class LidarWindow(QMainWindow):
         self.btn_floor_scan = QPushButton("Stabilize Floor")
         self.btn_flip_180 = QPushButton("Flip 180°")
         self.btn_cleanup_scan = QPushButton("Clean Up Scan")
+        self.btn_top_view = QPushButton("Top View")
+        self.btn_left_view = QPushButton("Left Side View")
+        self.btn_right_view = QPushButton("Right Side View")
+        self.btn_bottom_view = QPushButton("Bottom View")
         self.hide_ceiling_chk = QCheckBox("Hide ceiling in viewer")
         render_layout.addWidget(self.btn_clear_view)
         render_layout.addWidget(self.btn_floor_scan)
@@ -1729,9 +1815,25 @@ class LidarWindow(QMainWindow):
         self.log_lbl.setWordWrap(True)
         self.log_lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.log_lbl.setMinimumHeight(140)
-        self.log_lbl.setFixedWidth(280)
         self.log_lbl.setStyleSheet("border: 1px solid #3a3a3a; background: #171717; padding: 8px; border-radius: 6px;")
         self.right_layout.addWidget(self.log_lbl, 1)
+
+        viewer_group = QGroupBox("Viewer Buttons")
+        viewer_layout = QVBoxLayout(viewer_group)
+        viewer_layout.addWidget(self.btn_top_view)
+        viewer_layout.addWidget(self.btn_left_view)
+        viewer_layout.addWidget(self.btn_right_view)
+        viewer_layout.addWidget(self.btn_bottom_view)
+        self.right_layout.addWidget(viewer_group)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addStretch(1)
+        self.point_count_lbl = QLabel("Point Counter: 0")
+        self.point_count_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.point_count_lbl.setStyleSheet("font-weight: bold; padding: 4px 2px;")
+        bottom_row.addWidget(self.point_count_lbl)
+        bottom_row.addStretch(1)
+        self.right_layout.addLayout(bottom_row)
         #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
         #===== SECTION 12: UI LAYOUT END POINT =====
 
@@ -1744,9 +1846,14 @@ class LidarWindow(QMainWindow):
         self.btn_floor_scan.clicked.connect(self._stabilize_floor_clicked)
         self.btn_flip_180.clicked.connect(self._flip_180_clicked)
         self.btn_cleanup_scan.clicked.connect(self._cleanup_scan_clicked)
+        self.btn_top_view.clicked.connect(self._top_view_clicked)
+        self.btn_left_view.clicked.connect(self._left_view_clicked)
+        self.btn_right_view.clicked.connect(self._right_view_clicked)
+        self.btn_bottom_view.clicked.connect(self._bottom_view_clicked)
         self.hide_ceiling_chk.toggled.connect(self._hide_ceiling_toggled)
         self.btn_stitch.clicked.connect(self._stitch_clicked)
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
+        self.viewer3d.point_count_changed.connect(self._update_point_count_label)
 
 
     def _get_selected_queue_paths(self) -> List[str]:
