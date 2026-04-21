@@ -1196,7 +1196,7 @@ def _import_open3d():
 
 
 def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, distance_threshold: float = 0.02) -> str:
-    #fpfh+ransac global registration followed by point-to-plane icp for same-room scans from any position
+    #fpfh+ransac global registration followed by two-stage point-to-plane icp for same-room scans from any position
     o3d = _import_open3d()
 
     source_raw = o3d.io.read_point_cloud(source_path)
@@ -1207,7 +1207,11 @@ def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, d
     if target_raw.is_empty():
         raise ValueError(f"target cloud is empty: {os.path.basename(target_path)}")
 
-    voxel_size = 0.05
+    # large voxel for fpfh so each feature captures room-scale geometry (wall corners, transitions)
+    # rather than local surface texture that looks identical across a flat wall
+    fpfh_voxel = 0.3
+    icp_normal_radius = 0.1
+    merge_voxel = 0.05
     nb_neighbors = 30
     std_ratio = 2.0
 
@@ -1225,59 +1229,74 @@ def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, d
         return cleaned
 
     def _fpfh(cloud):
-        down = cloud.voxel_down_sample(voxel_size)
-        down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+        down = cloud.voxel_down_sample(fpfh_voxel)
+        down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=fpfh_voxel * 2, max_nn=30))
         features = o3d.pipelines.registration.compute_fpfh_feature(
             down,
-            o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5, max_nn=100),
+            o3d.geometry.KDTreeSearchParamHybrid(radius=fpfh_voxel * 5, max_nn=100),
         )
         return down, features
 
+    print("[stitch] normalizing floors and removing outliers...")
     source = _clean(_floor_normalize_o3d(source_raw))
     target = _clean(_floor_normalize_o3d(target_raw))
 
+    print("[stitch] extracting fpfh features...")
     source_down, source_fpfh = _fpfh(source)
     target_down, target_fpfh = _fpfh(target)
+    print(f"[stitch] {len(source_down.points)} source keypoints, {len(target_down.points)} target keypoints")
 
+    print("[stitch] running ransac global registration...")
     ransac_result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
         source_down,
         target_down,
         source_fpfh,
         target_fpfh,
-        mutual_filter=True,
-        max_correspondence_distance=voxel_size * 1.5,
+        mutual_filter=False,
+        max_correspondence_distance=fpfh_voxel * 1.5,
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
         ransac_n=3,
         checkers=[
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(voxel_size * 1.5),
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(fpfh_voxel * 1.5),
         ],
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999),
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(4000000, 0.999),
     )
+    print(f"[stitch] ransac fitness={ransac_result.fitness:.3f}  inlier_rmse={ransac_result.inlier_rmse:.3f}")
 
     if ransac_result.fitness < 0.05:
         print(
-            f"[stitch] warning: ransac fitness={ransac_result.fitness:.3f} is very low — "
-            "scans may not have enough overlapping geometry to align correctly"
+            "[stitch] warning: ransac fitness is very low — "
+            "scans may not have enough overlapping geometry; result may be incorrect"
         )
 
-    source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
-    target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+    print("[stitch] refining alignment with icp...")
+    source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=icp_normal_radius, max_nn=30))
+    target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=icp_normal_radius, max_nn=30))
 
-    icp_result = o3d.pipelines.registration.registration_icp(
+    # coarse icp pass bridges any residual error left by ransac before the tight fine pass
+    icp_coarse = o3d.pipelines.registration.registration_icp(
         source,
         target,
-        distance_threshold,
+        fpfh_voxel * 0.5,
         ransac_result.transformation,
         o3d.pipelines.registration.TransformationEstimationPointToPlane(),
     )
+    icp_fine = o3d.pipelines.registration.registration_icp(
+        source,
+        target,
+        distance_threshold,
+        icp_coarse.transformation,
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+    )
+    print(f"[stitch] icp fitness={icp_fine.fitness:.3f}  inlier_rmse={icp_fine.inlier_rmse:.4f}m")
 
     source_aligned = copy.deepcopy(source)
-    source_aligned.transform(icp_result.transformation)
+    source_aligned.transform(icp_fine.transformation)
 
     merged = source_aligned + target
     merged = _clean(merged)
-    merged = merged.voxel_down_sample(voxel_size)
+    merged = merged.voxel_down_sample(merge_voxel)
 
     if not o3d.io.write_point_cloud(output_path, merged):
         raise IOError(f"failed to save stitched model to {output_path}")
