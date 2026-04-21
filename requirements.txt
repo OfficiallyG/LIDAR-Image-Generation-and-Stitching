@@ -1,0 +1,11 @@
+# Laptop (interface.py)
+PyQt6
+pyqtgraph
+numpy
+open3d
+
+# Raspberry Pi (myLivox360.py, test_lidar.py, sender.py)
+# numpy       <- already listed above
+matplotlib
+opencv-python
+plyfile
