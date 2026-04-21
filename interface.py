@@ -461,6 +461,40 @@ def voxel_downsample_numpy(
     return out_xyz, out_rgb, out_intensity
 
 
+def _iqr_spatial_cull(
+    xyz: np.ndarray,
+    rgb: Optional[np.ndarray] = None,
+    intensity: Optional[np.ndarray] = None,
+    fence: float = 3.5,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    #remove points that are clearly outside the room's spatial extent — O(n), no neighbor lookups
+    #fence=3.5 x IQR is tight enough to catch floating outliers but won't clip real wall geometry
+    xyz = np.asarray(xyz, dtype=np.float32)
+    if len(xyz) < 10:
+        return xyz, rgb, intensity
+
+    #axis-wise box cull: removes points floating off the room on any single axis
+    q1 = np.percentile(xyz, 25, axis=0)
+    q3 = np.percentile(xyz, 75, axis=0)
+    iqr = np.maximum(q3 - q1, 1e-6)
+    in_box = np.all((xyz >= q1 - fence * iqr) & (xyz <= q3 + fence * iqr), axis=1)
+
+    #radial cull from robust centroid: catches points inside the per-axis box but floating
+    #diagonally (e.g. a multipath reflection through a corner)
+    centroid = np.median(xyz[in_box], axis=0) if in_box.any() else np.median(xyz, axis=0)
+    dist = np.linalg.norm(xyz - centroid, axis=1).astype(np.float32)
+    d25, d75 = float(np.percentile(dist, 25)), float(np.percentile(dist, 75))
+    d_iqr = max(d75 - d25, 1e-6)
+    in_sphere = dist <= d75 + fence * d_iqr
+
+    keep = in_box & in_sphere
+    return (
+        xyz[keep],
+        rgb[keep] if rgb is not None and len(rgb) == len(xyz) else rgb,
+        intensity[keep] if intensity is not None and len(intensity) == len(xyz) else intensity,
+    )
+
+
 def statistical_outlier_filter_numpy(
     xyz: np.ndarray,
     rgb: Optional[np.ndarray] = None,
@@ -469,21 +503,34 @@ def statistical_outlier_filter_numpy(
     z_thresh: float = 1.2,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     #remove stray points using local neighbor distances without external deps
+    #uses block-wise distance computation so peak memory stays bounded regardless of cloud size
     xyz = np.asarray(xyz, dtype=np.float32)
-    if len(xyz) <= max(8, k + 1):
+    n = len(xyz)
+    if n <= max(8, k + 1):
         return xyz, rgb, intensity
 
-    sample_cap = 2500
-    if len(xyz) > sample_cap:
-        idx = np.linspace(0, len(xyz) - 1, sample_cap, dtype=np.int32)
+    #reference subsample: 6000 points gives good coverage without blowing memory
+    ref_cap = 6000
+    ref_n = min(ref_cap, n)
+    if n > ref_n:
+        idx = np.round(np.linspace(0, n - 1, ref_n)).astype(np.int32)
         ref = xyz[idx]
     else:
         ref = xyz
 
-    d2 = np.sum((xyz[:, None, :] - ref[None, :, :]) ** 2, axis=2)
-    kk = min(k + 1, d2.shape[1])
-    nearest = np.partition(d2, kk - 1, axis=1)[:, :kk]
-    mean_neighbor_dist = np.sqrt(np.maximum(nearest[:, 1:], 0.0)).mean(axis=1)
+    kk = min(k + 1, ref_n)
+    mean_neighbor_dist = np.empty(n, dtype=np.float32)
+
+    #process in blocks of 3000 so peak memory per iteration is ~290 MB
+    #(3000 * 6000 * 3 * 4 bytes broadcast intermediate + 3000 * 6000 * 4 bytes d2 result)
+    block_size = 3000
+    for start in range(0, n, block_size):
+        end = min(start + block_size, n)
+        block = xyz[start:end]
+        d2 = np.sum((block[:, None, :] - ref[None, :, :]) ** 2, axis=2)
+        nearest = np.partition(d2, kk - 1, axis=1)[:, :kk]
+        mean_neighbor_dist[start:end] = np.sqrt(np.maximum(nearest[:, 1:], 0.0)).mean(axis=1)
+
     mu = float(mean_neighbor_dist.mean())
     sigma = float(mean_neighbor_dist.std())
     limit = mu + max(1e-6, z_thresh * sigma)
@@ -1022,7 +1069,7 @@ def build_short_raw_receive_path(inbox_dir: Path) -> Path:
 
 
 def cleanup_scan_to_new_file(input_path: str) -> str:
-    #clean a scan gently so room detail is preserved while obvious floaters are removed
+    #three-stage outlier removal: spatial cull, aggressive knn, cascade knn
     data = read_ply_data(input_path)
     xyz = data["xyz"]
     rgb = data.get("rgb")
@@ -1031,20 +1078,29 @@ def cleanup_scan_to_new_file(input_path: str) -> str:
     if xyz.size == 0:
         raise ValueError("scan contains no points")
 
+    intensity = None if intensity is None or len(intensity) != len(xyz) else np.asarray(intensity, dtype=np.float32)
+
     mins = xyz.min(axis=0)
     maxs = xyz.max(axis=0)
-    span = np.maximum(maxs - mins, 1e-6)
-    max_span = float(np.max(span))
-
-    #use a lighter downsample than before so desks, corners, and wall detail survive better
+    max_span = float(np.max(np.maximum(maxs - mins, 1e-6)))
     voxel_size = float(np.clip(max_span / 420.0, 0.010, 0.035))
-    intensity = None if intensity is None or len(intensity) != len(xyz) else np.asarray(intensity, dtype=np.float32)
 
     if len(xyz) > 120000:
         xyz, rgb, intensity = voxel_downsample_numpy(xyz, rgb, intensity=intensity, voxel_size=voxel_size)
 
-    #single lighter outlier pass so noise is reduced without chewing through good geometry
-    xyz, rgb, intensity = statistical_outlier_filter_numpy(xyz, rgb, intensity=intensity, k=10, z_thresh=1.8)
+    #stage 1: IQR spatial cull — removes "crazy far" floating points in O(n) before any
+    #neighbor lookups run; per-axis fence catches axis-aligned outliers, radial fence
+    #catches diagonal ones (multipath reflections through windows/corners)
+    xyz, rgb, intensity = _iqr_spatial_cull(xyz, rgb, intensity)
+
+    #stage 2: aggressive knn pass — k=20 gives a better statistical estimate than k=10
+    #and z_thresh=2.0 is tight enough to catch medium-distance outlier clusters
+    xyz, rgb, intensity = statistical_outlier_filter_numpy(xyz, rgb, intensity=intensity, k=20, z_thresh=2.0)
+
+    #stage 3: cascade knn pass — outlier clusters prop each other up in a single pass;
+    #after stage 2 removes obvious outliers, points whose only neighbors were other outliers
+    #are now isolated and caught here
+    xyz, rgb, intensity = statistical_outlier_filter_numpy(xyz, rgb, intensity=intensity, k=10, z_thresh=2.0)
 
     edited_rgb = build_edited_colors(xyz, intensity=intensity, height_from_floor=xyz[:, 2] if len(xyz) else None)
 
