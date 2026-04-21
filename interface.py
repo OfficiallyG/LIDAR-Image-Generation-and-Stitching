@@ -1181,39 +1181,90 @@ def _import_open3d():
         ) from e
 
 
-def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, distance_threshold: float = 0.2) -> str:
-    #direct built-in version of the provided open3d icp stitch algorithm for two scans
+def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, distance_threshold: float = 0.02) -> str:
+    #fpfh+ransac global registration followed by point-to-plane icp for same-room scans from any position
     o3d = _import_open3d()
-    source = o3d.io.read_point_cloud(source_path)
-    target = o3d.io.read_point_cloud(target_path)
 
-    if source.is_empty():
+    source_raw = o3d.io.read_point_cloud(source_path)
+    target_raw = o3d.io.read_point_cloud(target_path)
+
+    if source_raw.is_empty():
         raise ValueError(f"source cloud is empty: {os.path.basename(source_path)}")
-    if target.is_empty():
+    if target_raw.is_empty():
         raise ValueError(f"target cloud is empty: {os.path.basename(target_path)}")
 
-    initial_guess = np.identity(4)
+    voxel_size = 0.05
+    nb_neighbors = 30
+    std_ratio = 2.0
+
+    def _floor_normalize_o3d(cloud):
+        xyz = np.asarray(cloud.points, dtype=np.float32)
+        result = stabilize_scan_to_floor_frame_numpy(xyz)
+        normalized = o3d.geometry.PointCloud()
+        normalized.points = o3d.utility.Vector3dVector(result["xyz"])
+        if cloud.has_colors():
+            normalized.colors = cloud.colors
+        return normalized
+
+    def _clean(cloud):
+        cleaned, _ = cloud.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+        return cleaned
+
+    def _fpfh(cloud):
+        down = cloud.voxel_down_sample(voxel_size)
+        down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+        features = o3d.pipelines.registration.compute_fpfh_feature(
+            down,
+            o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5, max_nn=100),
+        )
+        return down, features
+
+    source = _clean(_floor_normalize_o3d(source_raw))
+    target = _clean(_floor_normalize_o3d(target_raw))
+
+    source_down, source_fpfh = _fpfh(source)
+    target_down, target_fpfh = _fpfh(target)
+
+    ransac_result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        source_down,
+        target_down,
+        source_fpfh,
+        target_fpfh,
+        mutual_filter=True,
+        max_correspondence_distance=voxel_size * 1.5,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        ransac_n=3,
+        checkers=[
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(voxel_size * 1.5),
+        ],
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999),
+    )
+
+    source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+    target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+
     icp_result = o3d.pipelines.registration.registration_icp(
         source,
         target,
         distance_threshold,
-        initial_guess,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        ransac_result.transformation,
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
     )
 
     source_aligned = copy.deepcopy(source)
     source_aligned.transform(icp_result.transformation)
 
-    merged_cloud = source_aligned + target
-    voxel_size = max(distance_threshold / 5.0, 1e-4)
-    merged_cloud = merged_cloud.voxel_down_sample(voxel_size=voxel_size)
+    merged = source_aligned + target
+    merged = _clean(merged)
+    merged = merged.voxel_down_sample(voxel_size)
 
-    if not o3d.io.write_point_cloud(output_path, merged_cloud):
+    if not o3d.io.write_point_cloud(output_path, merged):
         raise IOError(f"failed to save stitched model to {output_path}")
     return output_path
 
 
-def stitch_multiple_ply_files(input_paths: List[str], output_path: str, distance_threshold: float = 0.2) -> str:
+def stitch_multiple_ply_files(input_paths: List[str], output_path: str, distance_threshold: float = 0.02) -> str:
     #run the two-file icp stitch repeatedly so any number of selected scans can be merged
     if len(input_paths) < 2:
         raise ValueError("select at least 2 .ply scans to stitch")
