@@ -1314,7 +1314,6 @@ def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, d
     source_aligned.transform(icp_f.transformation)
 
     merged = source_aligned + target
-    merged = _clean(merged)
     merged = merged.voxel_down_sample(merge_voxel)
 
     if not o3d.io.write_point_cloud(output_path, merged):
