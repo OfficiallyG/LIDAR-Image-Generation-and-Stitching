@@ -284,7 +284,21 @@ def read_ply_data(path: str) -> Dict[str, Any]:
             raise ValueError("ply does not contain x y z columns")
 
         if fmt == "ascii":
-            data = np.loadtxt(f, dtype=np.float64, max_rows=vertex_count)
+            n_cols = len(prop_names)
+            rows = []
+            for _ in range(vertex_count):
+                raw = f.readline()
+                if not raw:
+                    break
+                try:
+                    vals = [float(v) for v in raw.split()]
+                except ValueError:
+                    continue
+                if len(vals) == n_cols:
+                    rows.append(vals)
+            if not rows:
+                raise ValueError(f"no valid vertex rows found in ascii ply: {os.path.basename(path)}")
+            data = np.array(rows, dtype=np.float64)
             if data.ndim == 1:
                 data = data.reshape(1, -1)
             xyz = data[:, [prop_names.index("x"), prop_names.index("y"), prop_names.index("z")]].astype(np.float32)
@@ -1240,6 +1254,12 @@ def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, d
         ],
         criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999),
     )
+
+    if ransac_result.fitness < 0.05:
+        print(
+            f"[stitch] warning: ransac fitness={ransac_result.fitness:.3f} is very low — "
+            "scans may not have enough overlapping geometry to align correctly"
+        )
 
     source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
     target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
