@@ -1196,7 +1196,8 @@ def _import_open3d():
 
 
 def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, distance_threshold: float = 0.02) -> str:
-    #fpfh+ransac global registration followed by two-stage point-to-plane icp for same-room scans from any position
+    #fpfh+ransac global registration followed by two-stage point-to-plane icp
+    #all distance parameters auto-scale to the point cloud coordinate units (m, cm, or mm)
     o3d = _import_open3d()
 
     source_raw = o3d.io.read_point_cloud(source_path)
@@ -1207,26 +1208,51 @@ def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, d
     if target_raw.is_empty():
         raise ValueError(f"target cloud is empty: {os.path.basename(target_path)}")
 
-    # large voxel for fpfh so each feature captures room-scale geometry (wall corners, transitions)
-    # rather than local surface texture that looks identical across a flat wall
-    fpfh_voxel = 0.3
-    icp_normal_radius = 0.1
-    merge_voxel = 0.05
     nb_neighbors = 30
     std_ratio = 2.0
 
-    def _floor_normalize_o3d(cloud):
+    def _level_floor(cloud):
+        #level the floor to Z=0 and center XY — no yaw normalization so ransac handles in-plane rotation
+        #forcing normal[2]>0 before rotating ensures both scans rotate the same direction
         xyz = np.asarray(cloud.points, dtype=np.float32)
-        result = stabilize_scan_to_floor_frame_numpy(xyz)
-        normalized = o3d.geometry.PointCloud()
-        normalized.points = o3d.utility.Vector3dVector(result["xyz"])
+        if len(xyz) < 50:
+            return cloud
+        floor_fit = detect_floor_plane_ransac_numpy(xyz)
+        normal = np.asarray(floor_fit["normal"], dtype=np.float64)
+        if normal[2] < 0:
+            normal = -normal
+        rot = _rotation_matrix_from_vectors(normal, np.array([0.0, 0.0, 1.0], dtype=np.float64))
+        xyz_lev = _apply_rotation(xyz, rot)
+        xyz_lev[:, 2] -= float(np.percentile(xyz_lev[:, 2], 3))
+        xy_ctr = np.median(xyz_lev[:, :2], axis=0)
+        xyz_lev[:, 0] -= float(xy_ctr[0])
+        xyz_lev[:, 1] -= float(xy_ctr[1])
+        out = o3d.geometry.PointCloud()
+        out.points = o3d.utility.Vector3dVector(xyz_lev)
         if cloud.has_colors():
-            normalized.colors = cloud.colors
-        return normalized
+            out.colors = cloud.colors
+        return out
 
     def _clean(cloud):
         cleaned, _ = cloud.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
         return cleaned
+
+    print("[stitch] leveling floors and removing outliers...")
+    source = _clean(_level_floor(source_raw))
+    target = _clean(_level_floor(target_raw))
+
+    # auto-detect coordinate scale from the actual bounding box — makes every subsequent
+    # distance parameter unit-agnostic whether the PLY is in metres, cm, or mm
+    all_pts = np.vstack([np.asarray(source.points), np.asarray(target.points)])
+    extents = np.max(all_pts, axis=0) - np.min(all_pts, axis=0)
+    max_extent = float(np.max(extents))
+    fpfh_voxel  = max_extent * 0.05   # 5% of scene — room-scale feature context
+    merge_voxel = max_extent * 0.008  # 0.8% of scene — fine output density
+    norm_radius = fpfh_voxel / 3.0
+    corr_dist   = fpfh_voxel * 1.5
+    icp_coarse_dist = fpfh_voxel * 0.5
+    icp_fine_dist   = max_extent * 0.004  # ~2 cm equivalent for a 5 m room
+    print(f"[stitch] scene extent={max_extent:.1f} units  fpfh_voxel={fpfh_voxel:.2f}  merge_voxel={merge_voxel:.3f}")
 
     def _fpfh(cloud):
         down = cloud.voxel_down_sample(fpfh_voxel)
@@ -1236,10 +1262,6 @@ def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, d
             o3d.geometry.KDTreeSearchParamHybrid(radius=fpfh_voxel * 5, max_nn=100),
         )
         return down, features
-
-    print("[stitch] normalizing floors and removing outliers...")
-    source = _clean(_floor_normalize_o3d(source_raw))
-    target = _clean(_floor_normalize_o3d(target_raw))
 
     print("[stitch] extracting fpfh features...")
     source_down, source_fpfh = _fpfh(source)
@@ -1253,12 +1275,12 @@ def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, d
         source_fpfh,
         target_fpfh,
         mutual_filter=False,
-        max_correspondence_distance=fpfh_voxel * 1.5,
+        max_correspondence_distance=corr_dist,
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
         ransac_n=3,
         checkers=[
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(fpfh_voxel * 1.5),
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(corr_dist),
         ],
         criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(4000000, 0.999),
     )
@@ -1270,29 +1292,26 @@ def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, d
             "scans may not have enough overlapping geometry; result may be incorrect"
         )
 
-    print("[stitch] refining alignment with icp...")
-    source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=icp_normal_radius, max_nn=30))
-    target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=icp_normal_radius, max_nn=30))
+    print("[stitch] refining alignment with two-stage icp...")
+    source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=norm_radius, max_nn=30))
+    target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=norm_radius, max_nn=30))
 
-    # coarse icp pass bridges any residual error left by ransac before the tight fine pass
-    icp_coarse = o3d.pipelines.registration.registration_icp(
-        source,
-        target,
-        fpfh_voxel * 0.5,
+    icp_c = o3d.pipelines.registration.registration_icp(
+        source, target,
+        icp_coarse_dist,
         ransac_result.transformation,
         o3d.pipelines.registration.TransformationEstimationPointToPlane(),
     )
-    icp_fine = o3d.pipelines.registration.registration_icp(
-        source,
-        target,
-        distance_threshold,
-        icp_coarse.transformation,
+    icp_f = o3d.pipelines.registration.registration_icp(
+        source, target,
+        icp_fine_dist,
+        icp_c.transformation,
         o3d.pipelines.registration.TransformationEstimationPointToPlane(),
     )
-    print(f"[stitch] icp fitness={icp_fine.fitness:.3f}  inlier_rmse={icp_fine.inlier_rmse:.4f}m")
+    print(f"[stitch] icp fitness={icp_f.fitness:.3f}  inlier_rmse={icp_f.inlier_rmse:.4f}")
 
     source_aligned = copy.deepcopy(source)
-    source_aligned.transform(icp_fine.transformation)
+    source_aligned.transform(icp_f.transformation)
 
     merged = source_aligned + target
     merged = _clean(merged)
