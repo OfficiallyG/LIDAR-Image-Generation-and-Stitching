@@ -11,7 +11,7 @@ import socket
 import struct
 #import tempfile for safe temporary stitched file names during multi-file merges
 import tempfile
-#import copy for open3d point cloud duplication during stitching
+#import copy kept for compatibility with older helper code
 import copy
 #import pathlib for safe cross-platform path building
 from pathlib import Path
@@ -20,7 +20,6 @@ from typing import Optional, List, Tuple, Dict, Any
 
 #import numpy for fast math and array operations for point clouds
 import numpy as np
-#import open3d lazily inside stitch functions so the app can still open even if stitching deps are missing
 #import pyqtgraph.opengl for 3d rendering widgets/items
 import pyqtgraph.opengl as gl
 #import qt core for ui constants, background thread, signals, and timers
@@ -1170,66 +1169,46 @@ def build_height_colors_rgba(xyz: np.ndarray) -> np.ndarray:
     return np.hstack((rgb, np.ones((len(rgb), 1), dtype=np.float32)))
 
 
-def _import_open3d():
-    #import open3d only when stitching is actually used so startup does not fail on machines missing the package
-    try:
-        import open3d as o3d
-        return o3d
-    except Exception as e:
-        raise ImportError(
-            "Open3D is required for stitching. Install it with: pip install open3d"
-        ) from e
-
-
-def _load_open3d_geometry_as_point_cloud(path: str):
-    #load the .ply using the new stitch.py style, with a point-cloud fallback for LiDAR scans
-    o3d = _import_open3d()
-
-    mesh = o3d.io.read_triangle_mesh(path)
-    if mesh is not None and mesh.has_vertices():
-        cloud = o3d.geometry.PointCloud()
-        cloud.points = mesh.vertices
-        if mesh.has_vertex_colors():
-            cloud.colors = mesh.vertex_colors
-        if not cloud.is_empty():
-            return cloud
-
-    cloud = o3d.io.read_point_cloud(path)
-    if cloud is not None and not cloud.is_empty():
-        return cloud
-
-    raise ValueError(f"could not load any points from: {os.path.basename(path)}")
+def _rgb_or_height_colors(xyz: np.ndarray, rgb: Optional[np.ndarray]) -> np.ndarray:
+    #use original rgb when available, otherwise create the same height color style used by the viewer
+    if rgb is not None and len(rgb) == len(xyz):
+        return np.clip(np.asarray(rgb), 0, 255).astype(np.uint8)
+    return build_height_colors_rgb(xyz)
 
 
 def place_objects_side_by_side(source_path: str, target_path: str, output_path: str, gap: float = 1.0) -> str:
-    #this is the new stitch.py code connected to the app's Stitch button
+    #new stitch code connected to the app's Stitch button without requiring Open3D
     #it places the selected source scan next to the target scan instead of running ICP alignment
-    o3d = _import_open3d()
+    source_data = read_ply_data(source_path)
+    target_data = read_ply_data(target_path)
 
-    source_cloud = _load_open3d_geometry_as_point_cloud(source_path)
-    target_cloud = _load_open3d_geometry_as_point_cloud(target_path)
+    source_xyz = np.asarray(source_data["xyz"], dtype=np.float32)
+    target_xyz = np.asarray(target_data["xyz"], dtype=np.float32)
 
-    if source_cloud.is_empty():
+    if source_xyz.size == 0:
         raise ValueError(f"source cloud is empty: {os.path.basename(source_path)}")
-    if target_cloud.is_empty():
+    if target_xyz.size == 0:
         raise ValueError(f"target cloud is empty: {os.path.basename(target_path)}")
 
     #calculate bounding boxes to find the outermost edges of the scans
-    target_max_bound = target_cloud.get_max_bound()
-    source_min_bound = source_cloud.get_min_bound()
+    target_max_bound = target_xyz.max(axis=0)
+    source_min_bound = source_xyz.min(axis=0)
 
     #move the source purely along the x-axis so it sits beside the target
     shift_x = float(target_max_bound[0] - source_min_bound[0] + gap)
-    translation_vector = np.array([shift_x, 0.0, 0.0], dtype=np.float64)
+    source_moved = source_xyz.copy()
+    source_moved[:, 0] += shift_x
 
-    #copy the source so the original file is not changed
-    source_moved = copy.deepcopy(source_cloud)
-    source_moved.translate(translation_vector)
+    #combine both scans into the same output file
+    combined_xyz = np.vstack((target_xyz, source_moved)).astype(np.float32)
 
-    #combine both scans into the same file
-    combined_cloud = target_cloud + source_moved
+    target_rgb = _rgb_or_height_colors(target_xyz, target_data.get("rgb"))
+    source_rgb = _rgb_or_height_colors(source_xyz, source_data.get("rgb"))
+    combined_rgb = np.vstack((target_rgb, source_rgb)).astype(np.uint8)
 
-    if not o3d.io.write_point_cloud(output_path, combined_cloud, write_ascii=True):
+    write_ply_xyzrgb_ascii(output_path, combined_xyz, combined_rgb)
+
+    if not os.path.exists(output_path):
         raise IOError(f"failed to save stitched model to {output_path}")
 
     return output_path
