@@ -1,5 +1,5 @@
 #===== SECTION 1: IMPORTS START POINT =====
-# #import sys for argv and clean app exit
+#import sys for argv and clean app exit
 import sys
 #import os for safe filename handling and file existence checks
 import os
@@ -943,8 +943,6 @@ def remove_detected_ceiling_numpy(
     out_intensity = intensity[keep] if intensity is not None and len(intensity) == len(xyz) else None
     return out_xyz, out_rgb, out_intensity, float(cut_height)
 
-
-
 def _extract_short_base_and_tags(stem: str) -> Tuple[Optional[str], List[str]]:
     #read names like 001, 001-f, 001-f-c, 001-x, etc.
     m = re.fullmatch(r"(\d{3})(?:-([a-z](?:-[a-z])*))?", stem.lower())
@@ -1136,9 +1134,7 @@ def flip_scan_180_to_new_file(input_path: str) -> str:
     return str(output_path)
 #===== SECTION 5: PLY LOADING HELPERS END POINT =====
 
-
-
-#===== SECTION 5B: STITCHING HELPERS START POINT =====
+#===== SECTION 6: STITCHING HELPERS START POINT =====
 
 
 def build_stitched_output_path(input_paths: List[str]) -> str:
@@ -1181,40 +1177,67 @@ def _import_open3d():
         ) from e
 
 
-def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, distance_threshold: float = 0.2) -> str:
-    #direct built-in version of the provided open3d icp stitch algorithm for two scans
+def _load_open3d_geometry_as_point_cloud(path: str):
+    #load the .ply using the new stitch.py style, with a point-cloud fallback for LiDAR scans
     o3d = _import_open3d()
-    source = o3d.io.read_point_cloud(source_path)
-    target = o3d.io.read_point_cloud(target_path)
 
-    if source.is_empty():
+    mesh = o3d.io.read_triangle_mesh(path)
+    if mesh is not None and mesh.has_vertices():
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = mesh.vertices
+        if mesh.has_vertex_colors():
+            cloud.colors = mesh.vertex_colors
+        if not cloud.is_empty():
+            return cloud
+
+    cloud = o3d.io.read_point_cloud(path)
+    if cloud is not None and not cloud.is_empty():
+        return cloud
+
+    raise ValueError(f"could not load any points from: {os.path.basename(path)}")
+
+
+def place_objects_side_by_side(source_path: str, target_path: str, output_path: str, gap: float = 1.0) -> str:
+    #this is the new stitch.py code connected to the app's Stitch button
+    #it places the selected source scan next to the target scan instead of running ICP alignment
+    o3d = _import_open3d()
+
+    source_cloud = _load_open3d_geometry_as_point_cloud(source_path)
+    target_cloud = _load_open3d_geometry_as_point_cloud(target_path)
+
+    if source_cloud.is_empty():
         raise ValueError(f"source cloud is empty: {os.path.basename(source_path)}")
-    if target.is_empty():
+    if target_cloud.is_empty():
         raise ValueError(f"target cloud is empty: {os.path.basename(target_path)}")
 
-    initial_guess = np.identity(4)
-    icp_result = o3d.pipelines.registration.registration_icp(
-        source,
-        target,
-        distance_threshold,
-        initial_guess,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-    )
+    #calculate bounding boxes to find the outermost edges of the scans
+    target_max_bound = target_cloud.get_max_bound()
+    source_min_bound = source_cloud.get_min_bound()
 
-    source_aligned = copy.deepcopy(source)
-    source_aligned.transform(icp_result.transformation)
+    #move the source purely along the x-axis so it sits beside the target
+    shift_x = float(target_max_bound[0] - source_min_bound[0] + gap)
+    translation_vector = np.array([shift_x, 0.0, 0.0], dtype=np.float64)
 
-    merged_cloud = source_aligned + target
-    voxel_size = max(distance_threshold / 5.0, 1e-4)
-    merged_cloud = merged_cloud.voxel_down_sample(voxel_size=voxel_size)
+    #copy the source so the original file is not changed
+    source_moved = copy.deepcopy(source_cloud)
+    source_moved.translate(translation_vector)
 
-    if not o3d.io.write_point_cloud(output_path, merged_cloud):
+    #combine both scans into the same file
+    combined_cloud = target_cloud + source_moved
+
+    if not o3d.io.write_point_cloud(output_path, combined_cloud, write_ascii=True):
         raise IOError(f"failed to save stitched model to {output_path}")
+
     return output_path
 
 
-def stitch_multiple_ply_files(input_paths: List[str], output_path: str, distance_threshold: float = 0.2) -> str:
-    #run the two-file icp stitch repeatedly so any number of selected scans can be merged
+def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, gap: float = 1.0) -> str:
+    #keep the old app function name, but route it to the new side-by-side stitch code
+    return place_objects_side_by_side(source_path, target_path, output_path, gap=gap)
+
+
+def stitch_multiple_ply_files(input_paths: List[str], output_path: str, gap: float = 1.0) -> str:
+    #run the new side-by-side stitch repeatedly so any number of selected scans can be combined
     if len(input_paths) < 2:
         raise ValueError("select at least 2 .ply scans to stitch")
 
@@ -1225,11 +1248,11 @@ def stitch_multiple_ply_files(input_paths: List[str], output_path: str, distance
         for index, next_path in enumerate(ordered_paths[1:], start=1):
             is_last_merge = index == (len(ordered_paths) - 1)
             current_output = output_path if is_last_merge else str(Path(temp_dir) / f"partial_merge_{index}.ply")
-            stitch_two_ply_files(
+            place_objects_side_by_side(
                 source_path=next_path,
                 target_path=running_path,
                 output_path=current_output,
-                distance_threshold=distance_threshold,
+                gap=gap,
             )
             running_path = current_output
 
@@ -1244,19 +1267,21 @@ class StitchWorker(QThread):
     #thread-safe stitch failure reporting
     error = pyqtSignal(str)
 
-    def __init__(self, input_paths: List[str], output_path: str, parent=None):
+    def __init__(self, input_paths: List[str], output_path: str, gap: float = 1.0, parent=None):
         super().__init__(parent)
         self.input_paths = input_paths
         self.output_path = output_path
+        self.gap = max(0.0, float(gap))
 
     def run(self):
-        #run the built-in multi-file stitcher using the selected queue items
+        #run the new side-by-side stitch code using the selected queue items
         try:
             self.log.emit(f"[stitch] stitching {len(self.input_paths)} selected file(s)...")
+            self.log.emit(f"[stitch] mode: side-by-side placement | gap={self.gap:g}")
             for idx, path in enumerate(self.input_paths, start=1):
                 self.log.emit(f"[stitch] {idx}. {os.path.basename(path)}")
 
-            final_output = stitch_multiple_ply_files(self.input_paths, self.output_path)
+            final_output = stitch_multiple_ply_files(self.input_paths, self.output_path, gap=self.gap)
 
             if not os.path.exists(final_output):
                 raise FileNotFoundError(
@@ -1268,8 +1293,9 @@ class StitchWorker(QThread):
 
         except Exception as e:
             self.error.emit(f"[stitch] failed: {e}")
-#===== SECTION 5B: STITCHING HELPERS END POINT =====
+#===== SECTION 6: STITCHING HELPERS END POINT =====
 
+#===== SECTION 7: DARK APP STYLESHEET START POINT =====
 def build_dark_app_stylesheet() -> str:
     #dark ui theme so controls match the black viewer background
     return """
@@ -1360,9 +1386,10 @@ def build_dark_app_stylesheet() -> str:
         background-color: #121212;
     }
     """
+#===== SECTION 7: DARK APP STYLESHEET END POINT =====
 
 
-#===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) START POINT =====
+#===== SECTION 8: 3D VIEWPORT (SINGLE SCAN) START POINT =====
 class SinglePLYViewport(QWidget):
     point_count_changed = pyqtSignal(int)
 
@@ -1513,9 +1540,9 @@ class SinglePLYViewport(QWidget):
         self._ceiling_cut_height = estimate_ceiling_cut_height(pos[:, 2])
         self._refresh_display()
 
-#===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) END POINT =====
+#===== SECTION 8: 3D VIEWPORT (SINGLE SCAN) END POINT =====
 
-#===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) START POINT =====
+#===== SECTION 9: MAIN WINDOW (UI + APP LOGIC) START POINT =====
 class LidarWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1528,27 +1555,26 @@ class LidarWindow(QMainWindow):
         self.stitch_worker: Optional[StitchWorker] = None
         self.hide_ceiling_enabled = False
 
-        #===== SECTION 8: UI CREATION START POINT =====
+        #===== SECTION 10: APP STARTUP CALLS START POINT =====
+        #build the ui before connecting events or starting services
         self._build_ui()
+        #apply the dark stylesheet after widgets exist
         self.setStyleSheet(build_dark_app_stylesheet())
-        #===== SECTION 8: UI CREATION END POINT =====
 
-        #===== SECTION 9: UI SIGNAL WIRING START POINT =====
+        #connect buttons and ui actions to their handler functions
         self._wire_min_signals()
-        #===== SECTION 9: UI SIGNAL WIRING END POINT =====
 
-        #===== SECTION 10: RECEIVER STARTUP START POINT =====
+        #start the receiver service so incoming scans can arrive immediately
         self._start_receiver()
         self._log("ui initialized. receiver is running.")
-        #===== SECTION 10: RECEIVER STARTUP END POINT =====
 
-        #===== SECTION 11: IP REFRESH TIMER START POINT =====
+        #refresh the displayed laptop ip so the raspberry pi can send to the correct address
         self._ip_timer = QTimer(self)
         self._ip_timer.setInterval(2500)
         self._ip_timer.timeout.connect(self._refresh_ip_label)
         self._ip_timer.start()
         self._refresh_ip_label()
-        #===== SECTION 11: IP REFRESH TIMER END POINT =====
+        #===== SECTION 10: APP STARTUP CALLS END POINT =====
 
     def _start_receiver(self):
         #start tcp receiver in a background thread so ui stays responsive
@@ -1622,8 +1648,6 @@ class LidarWindow(QMainWindow):
         filename = os.path.basename(saved_path)
         self._add_queue_item(filename, saved_path)
         self._log(f"received -> Desktop/LiDAR_Inbox: {filename}")
-
-
 
     def _add_queue_item(self, display_name: str, actual_path: str):
         #add a file to the queue with a display label that can differ from the disk filename
@@ -1717,14 +1741,14 @@ class LidarWindow(QMainWindow):
         self._log("camera set to bottom view.")
 
     def _build_ui(self):
-        #===== SECTION 12: UI LAYOUT START POINT =====
+        #===== SECTION 11: UI LAYOUT START POINT =====
         root = QWidget()
         self.setCentralWidget(root)
         main_layout = QHBoxLayout(root)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
 
-        #===== SECTION 13: LEFT COLUMN (QUEUE + STATUS) START POINT =====
+        #===== SECTION 12: LEFT COLUMN (QUEUE + STATUS) START POINT =====
         left = QVBoxLayout()
         left.setSpacing(8)
         main_layout.addLayout(left, 1)
@@ -1769,9 +1793,9 @@ class LidarWindow(QMainWindow):
 
         self.btn_toggle_right = QPushButton("Hide Side Panel")
         left.addWidget(self.btn_toggle_right)
-        #===== SECTION 13: LEFT COLUMN (QUEUE + STATUS) END POINT =====
+        #===== SECTION 12: LEFT COLUMN (QUEUE + STATUS) END POINT =====
 
-        #===== SECTION 14: CENTER COLUMN (3D VIEW) START POINT =====
+        #===== SECTION 13: CENTER COLUMN (3D VIEW) START POINT =====
         center = QVBoxLayout()
         center.setSpacing(8)
         main_layout.addLayout(center, 4)
@@ -1779,9 +1803,9 @@ class LidarWindow(QMainWindow):
         self.viewer3d = SinglePLYViewport()
         center.addWidget(self.viewer3d, 1)
 
-        #===== SECTION 14: CENTER COLUMN (3D VIEW) END POINT =====
+        #===== SECTION 13: CENTER COLUMN (3D VIEW) END POINT =====
 
-        #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) START POINT =====
+        #===== SECTION 14: RIGHT COLUMN (CONTROLS + LOG) START POINT =====
         self.right_panel = QWidget()
         self.right_layout = QVBoxLayout(self.right_panel)
         self.right_layout.setContentsMargins(0, 0, 0, 0)
@@ -1878,11 +1902,11 @@ class LidarWindow(QMainWindow):
         main_layout.setStretch(0, 1)
         main_layout.setStretch(1, 4)
         main_layout.setStretch(2, 2)
-        #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
-        #===== SECTION 12: UI LAYOUT END POINT =====
+        #===== SECTION 14: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
+        #===== SECTION 11: UI LAYOUT END POINT =====
 
     def _wire_min_signals(self):
-        #===== SECTION 16: UI EVENTS START POINT =====
+        #===== SECTION 15: UI EVENTS START POINT =====
         self.btn_import_local.clicked.connect(self._import_local_clicked)
         self.btn_delete.clicked.connect(self._delete_selected_clicked)
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_viewer)
@@ -1898,7 +1922,7 @@ class LidarWindow(QMainWindow):
         self.btn_stitch.clicked.connect(self._stitch_clicked)
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
         self.viewer3d.point_count_changed.connect(self._update_point_count_label)
-        #===== SECTION 16: UI EVENTS END POINT =====
+        #===== SECTION 15: UI EVENTS END POINT =====
 
     def _get_selected_queue_paths(self) -> List[str]:
         #return valid file paths for all currently selected queue items
@@ -2029,14 +2053,14 @@ class LidarWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
-#===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) END POINT =====
+#===== SECTION 9: MAIN WINDOW (UI + APP LOGIC) END POINT =====
 
-#===== SECTION 17: APP ENTRYPOINT START POINT =====
+#===== SECTION 16: APP ENTRYPOINT START POINT =====
 def main():
     lidar_app = QApplication(sys.argv)
     lidar_main = LidarWindow()
     lidar_main.show()
     sys.exit(lidar_app.exec())
-#===== SECTION 17: APP ENTRYPOINT END POINT =====
+#===== SECTION 16: APP ENTRYPOINT END POINT =====
 if __name__ == "__main__":
     main()
