@@ -1,5 +1,5 @@
 #===== SECTION 1: IMPORTS START POINT =====
-#import sys for argv and clean app exit
+# #import sys for argv and clean app exit
 import sys
 #import os for safe filename handling and file existence checks
 import os
@@ -943,6 +943,8 @@ def remove_detected_ceiling_numpy(
     out_intensity = intensity[keep] if intensity is not None and len(intensity) == len(xyz) else None
     return out_xyz, out_rgb, out_intensity, float(cut_height)
 
+
+
 def _extract_short_base_and_tags(stem: str) -> Tuple[Optional[str], List[str]]:
     #read names like 001, 001-f, 001-f-c, 001-x, etc.
     m = re.fullmatch(r"(\d{3})(?:-([a-z](?:-[a-z])*))?", stem.lower())
@@ -1134,7 +1136,9 @@ def flip_scan_180_to_new_file(input_path: str) -> str:
     return str(output_path)
 #===== SECTION 5: PLY LOADING HELPERS END POINT =====
 
-#===== SECTION 6: STITCHING HELPERS START POINT =====
+
+
+#===== SECTION 5B: STITCHING HELPERS START POINT =====
 
 
 def build_stitched_output_path(input_paths: List[str]) -> str:
@@ -1293,9 +1297,8 @@ class StitchWorker(QThread):
 
         except Exception as e:
             self.error.emit(f"[stitch] failed: {e}")
-#===== SECTION 6: STITCHING HELPERS END POINT =====
+#===== SECTION 5B: STITCHING HELPERS END POINT =====
 
-#===== SECTION 7: DARK APP STYLESHEET START POINT =====
 def build_dark_app_stylesheet() -> str:
     #dark ui theme so controls match the black viewer background
     return """
@@ -1386,10 +1389,9 @@ def build_dark_app_stylesheet() -> str:
         background-color: #121212;
     }
     """
-#===== SECTION 7: DARK APP STYLESHEET END POINT =====
 
 
-#===== SECTION 8: 3D VIEWPORT (SINGLE SCAN) START POINT =====
+#===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) START POINT =====
 class SinglePLYViewport(QWidget):
     point_count_changed = pyqtSignal(int)
 
@@ -1540,9 +1542,9 @@ class SinglePLYViewport(QWidget):
         self._ceiling_cut_height = estimate_ceiling_cut_height(pos[:, 2])
         self._refresh_display()
 
-#===== SECTION 8: 3D VIEWPORT (SINGLE SCAN) END POINT =====
+#===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) END POINT =====
 
-#===== SECTION 9: MAIN WINDOW (UI + APP LOGIC) START POINT =====
+#===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) START POINT =====
 class LidarWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1555,26 +1557,27 @@ class LidarWindow(QMainWindow):
         self.stitch_worker: Optional[StitchWorker] = None
         self.hide_ceiling_enabled = False
 
-        #===== SECTION 10: APP STARTUP CALLS START POINT =====
-        #build the ui before connecting events or starting services
+        #===== SECTION 8: UI CREATION START POINT =====
         self._build_ui()
-        #apply the dark stylesheet after widgets exist
         self.setStyleSheet(build_dark_app_stylesheet())
+        #===== SECTION 8: UI CREATION END POINT =====
 
-        #connect buttons and ui actions to their handler functions
+        #===== SECTION 9: UI SIGNAL WIRING START POINT =====
         self._wire_min_signals()
+        #===== SECTION 9: UI SIGNAL WIRING END POINT =====
 
-        #start the receiver service so incoming scans can arrive immediately
+        #===== SECTION 10: RECEIVER STARTUP START POINT =====
         self._start_receiver()
         self._log("ui initialized. receiver is running.")
+        #===== SECTION 10: RECEIVER STARTUP END POINT =====
 
-        #refresh the displayed laptop ip so the raspberry pi can send to the correct address
+        #===== SECTION 11: IP REFRESH TIMER START POINT =====
         self._ip_timer = QTimer(self)
         self._ip_timer.setInterval(2500)
         self._ip_timer.timeout.connect(self._refresh_ip_label)
         self._ip_timer.start()
         self._refresh_ip_label()
-        #===== SECTION 10: APP STARTUP CALLS END POINT =====
+        #===== SECTION 11: IP REFRESH TIMER END POINT =====
 
     def _start_receiver(self):
         #start tcp receiver in a background thread so ui stays responsive
@@ -1648,6 +1651,8 @@ class LidarWindow(QMainWindow):
         filename = os.path.basename(saved_path)
         self._add_queue_item(filename, saved_path)
         self._log(f"received -> Desktop/LiDAR_Inbox: {filename}")
+
+
 
     def _add_queue_item(self, display_name: str, actual_path: str):
         #add a file to the queue with a display label that can differ from the disk filename
@@ -1741,14 +1746,14 @@ class LidarWindow(QMainWindow):
         self._log("camera set to bottom view.")
 
     def _build_ui(self):
-        #===== SECTION 11: UI LAYOUT START POINT =====
+        #===== SECTION 12: UI LAYOUT START POINT =====
         root = QWidget()
         self.setCentralWidget(root)
         main_layout = QHBoxLayout(root)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
 
-        #===== SECTION 12: LEFT COLUMN (QUEUE + STATUS) START POINT =====
+        #===== SECTION 13: LEFT COLUMN (QUEUE + STATUS) START POINT =====
         left = QVBoxLayout()
         left.setSpacing(8)
         main_layout.addLayout(left, 1)
@@ -1777,7 +1782,7 @@ class LidarWindow(QMainWindow):
 
         left.addWidget(QLabel("Scans Queue"))
         self.scan_list = QListWidget()
-        self.scan_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.scan_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         self.scan_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left.addWidget(self.scan_list, 1)
 
@@ -1793,9 +1798,9 @@ class LidarWindow(QMainWindow):
 
         self.btn_toggle_right = QPushButton("Hide Side Panel")
         left.addWidget(self.btn_toggle_right)
-        #===== SECTION 12: LEFT COLUMN (QUEUE + STATUS) END POINT =====
+        #===== SECTION 13: LEFT COLUMN (QUEUE + STATUS) END POINT =====
 
-        #===== SECTION 13: CENTER COLUMN (3D VIEW) START POINT =====
+        #===== SECTION 14: CENTER COLUMN (3D VIEW) START POINT =====
         center = QVBoxLayout()
         center.setSpacing(8)
         main_layout.addLayout(center, 4)
@@ -1803,9 +1808,9 @@ class LidarWindow(QMainWindow):
         self.viewer3d = SinglePLYViewport()
         center.addWidget(self.viewer3d, 1)
 
-        #===== SECTION 13: CENTER COLUMN (3D VIEW) END POINT =====
+        #===== SECTION 14: CENTER COLUMN (3D VIEW) END POINT =====
 
-        #===== SECTION 14: RIGHT COLUMN (CONTROLS + LOG) START POINT =====
+        #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) START POINT =====
         self.right_panel = QWidget()
         self.right_layout = QVBoxLayout(self.right_panel)
         self.right_layout.setContentsMargins(0, 0, 0, 0)
@@ -1902,11 +1907,11 @@ class LidarWindow(QMainWindow):
         main_layout.setStretch(0, 1)
         main_layout.setStretch(1, 4)
         main_layout.setStretch(2, 2)
-        #===== SECTION 14: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
-        #===== SECTION 11: UI LAYOUT END POINT =====
+        #===== SECTION 15: RIGHT COLUMN (CONTROLS + LOG) END POINT =====
+        #===== SECTION 12: UI LAYOUT END POINT =====
 
     def _wire_min_signals(self):
-        #===== SECTION 15: UI EVENTS START POINT =====
+        #===== SECTION 16: UI EVENTS START POINT =====
         self.btn_import_local.clicked.connect(self._import_local_clicked)
         self.btn_delete.clicked.connect(self._delete_selected_clicked)
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_viewer)
@@ -1922,10 +1927,10 @@ class LidarWindow(QMainWindow):
         self.btn_stitch.clicked.connect(self._stitch_clicked)
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
         self.viewer3d.point_count_changed.connect(self._update_point_count_label)
-        #===== SECTION 15: UI EVENTS END POINT =====
+        #===== SECTION 16: UI EVENTS END POINT =====
 
     def _get_selected_queue_paths(self) -> List[str]:
-        #return valid file paths for all currently selected queue items
+        #return valid file paths for all individually selected queue items
         selected_paths: List[str] = []
         for item in self.scan_list.selectedItems():
             path = item.data(Qt.ItemDataRole.UserRole)
@@ -2053,14 +2058,14 @@ class LidarWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
-#===== SECTION 9: MAIN WINDOW (UI + APP LOGIC) END POINT =====
+#===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) END POINT =====
 
-#===== SECTION 16: APP ENTRYPOINT START POINT =====
+#===== SECTION 17: APP ENTRYPOINT START POINT =====
 def main():
     lidar_app = QApplication(sys.argv)
     lidar_main = LidarWindow()
     lidar_main.show()
     sys.exit(lidar_app.exec())
-#===== SECTION 16: APP ENTRYPOINT END POINT =====
+#===== SECTION 17: APP ENTRYPOINT END POINT =====
 if __name__ == "__main__":
     main()
