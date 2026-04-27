@@ -2,6 +2,7 @@
 LIDAR Image Generation and Stitching project
 This Project is for the Polk County Sherrifs Department via the Capstone course at Florida Polytechnic University.
 This project has 5 files in total all of which are coded in Python.
+
 Files:
 
 1. interface.py
