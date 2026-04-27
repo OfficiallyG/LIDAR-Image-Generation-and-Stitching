@@ -9,8 +9,6 @@ import re
 import socket
 #import struct for packing/unpacking fixed-size integers in the transfer protocol
 import struct
-#import tempfile for safe temporary stitched file names during multi-file merges
-import tempfile
 #import copy kept for compatibility with older helper code
 import copy
 #import pathlib for safe cross-platform path building
@@ -1060,50 +1058,6 @@ def remove_ceiling_to_new_file(input_path: str) -> str:
     return str(output_path)
 
 
-def stabilize_floor_to_new_file(input_path: str) -> str:
-    #detect the floor plane on a lightly cleaned copy, then apply that stabilized transform back to the full scan
-    data = read_ply_data(input_path)
-    xyz = data["xyz"]
-    rgb = data.get("rgb")
-    intensity = data.get("intensity")
-
-    if xyz.size == 0:
-        raise ValueError("scan contains no points")
-
-    mins = xyz.min(axis=0)
-    maxs = xyz.max(axis=0)
-    span = np.maximum(maxs - mins, 1e-6)
-    max_span = float(np.max(span))
-    floor_voxel = float(np.clip(max_span / 220.0, 0.030, 0.120))
-
-    work_xyz, work_rgb, work_intensity = voxel_downsample_numpy(xyz, rgb, intensity=intensity, voxel_size=floor_voxel)
-    work_xyz, work_rgb, work_intensity = statistical_outlier_filter_numpy(work_xyz, work_rgb, intensity=work_intensity, k=14, z_thresh=1.1)
-
-    stabilized = stabilize_scan_to_floor_frame_numpy(work_xyz, rgb=work_rgb, intensity=work_intensity)
-    level_rotation = np.asarray(stabilized["rotation_level"], dtype=np.float64)
-    yaw_rotation = np.asarray(stabilized["rotation_yaw"], dtype=np.float64)
-    flip_rotation = np.asarray(stabilized["rotation_flip"], dtype=np.float64)
-    combined_rotation = flip_rotation @ yaw_rotation @ level_rotation
-
-    out_xyz = _apply_rotation(xyz, combined_rotation)
-    if len(out_xyz) > 0:
-        floor_ref = float(np.percentile(out_xyz[:, 2], 1))
-        out_xyz[:, 2] -= floor_ref
-        xy_center = np.median(out_xyz[:, :2], axis=0)
-        out_xyz[:, 0] -= float(xy_center[0])
-        out_xyz[:, 1] -= float(xy_center[1])
-
-    out_rgb = build_edited_colors(
-        out_xyz,
-        intensity=intensity,
-        height_from_floor=out_xyz[:, 2] if len(out_xyz) else None,
-    )
-
-    output_path = build_short_output_path(input_path, ["f"])
-
-    write_ply_xyzrgb_ascii(str(output_path), out_xyz, out_rgb)
-    return str(output_path)
-
 
 def flip_scan_180_to_new_file(input_path: str) -> str:
     #flip a leveled scan upside down by rotating 180 degrees about the x-axis
@@ -1137,22 +1091,10 @@ def flip_scan_180_to_new_file(input_path: str) -> str:
 
 
 
-#===== SECTION 5B: STITCHING HELPERS START POINT =====
-
-
-def build_stitched_output_path(input_paths: List[str]) -> str:
-    #save stitched result with short 3-digit naming
-    if not input_paths:
-        raise ValueError("no input paths were provided for stitching")
-
-    first_path = Path(input_paths[0])
-    parent = first_path.parent if first_path.parent.exists() else INBOX_DIR
-    seed_input = str(parent / f"{_next_short_base(parent)}.ply")
-    return build_short_output_path(seed_input, ["s"])
-
+#===== SECTION 5B: VIEWER COLOR HELPERS START POINT =====
 
 def build_height_colors_rgb(xyz: np.ndarray) -> np.ndarray:
-    #apply one consistent height-based color scheme for regular, cleaned, and stitched scans
+    #apply one consistent height-based color scheme for regular and cleaned scans
     xyz = np.asarray(xyz, dtype=np.float32)
     if xyz.size == 0:
         return np.zeros((0, 3), dtype=np.uint8)
@@ -1167,116 +1109,7 @@ def build_height_colors_rgba(xyz: np.ndarray) -> np.ndarray:
     if len(rgb) == 0:
         return np.zeros((0, 4), dtype=np.float32)
     return np.hstack((rgb, np.ones((len(rgb), 1), dtype=np.float32)))
-
-
-def _rgb_or_height_colors(xyz: np.ndarray, rgb: Optional[np.ndarray]) -> np.ndarray:
-    #use original rgb when available, otherwise create the same height color style used by the viewer
-    if rgb is not None and len(rgb) == len(xyz):
-        return np.clip(np.asarray(rgb), 0, 255).astype(np.uint8)
-    return build_height_colors_rgb(xyz)
-
-
-def place_objects_side_by_side(source_path: str, target_path: str, output_path: str, gap: float = 1.0) -> str:
-    #new stitch code connected to the app's Stitch button without requiring Open3D
-    #it places the selected source scan next to the target scan instead of running ICP alignment
-    source_data = read_ply_data(source_path)
-    target_data = read_ply_data(target_path)
-
-    source_xyz = np.asarray(source_data["xyz"], dtype=np.float32)
-    target_xyz = np.asarray(target_data["xyz"], dtype=np.float32)
-
-    if source_xyz.size == 0:
-        raise ValueError(f"source cloud is empty: {os.path.basename(source_path)}")
-    if target_xyz.size == 0:
-        raise ValueError(f"target cloud is empty: {os.path.basename(target_path)}")
-
-    #calculate bounding boxes to find the outermost edges of the scans
-    target_max_bound = target_xyz.max(axis=0)
-    source_min_bound = source_xyz.min(axis=0)
-
-    #move the source purely along the x-axis so it sits beside the target
-    shift_x = float(target_max_bound[0] - source_min_bound[0] + gap)
-    source_moved = source_xyz.copy()
-    source_moved[:, 0] += shift_x
-
-    #combine both scans into the same output file
-    combined_xyz = np.vstack((target_xyz, source_moved)).astype(np.float32)
-
-    target_rgb = _rgb_or_height_colors(target_xyz, target_data.get("rgb"))
-    source_rgb = _rgb_or_height_colors(source_xyz, source_data.get("rgb"))
-    combined_rgb = np.vstack((target_rgb, source_rgb)).astype(np.uint8)
-
-    write_ply_xyzrgb_ascii(output_path, combined_xyz, combined_rgb)
-
-    if not os.path.exists(output_path):
-        raise IOError(f"failed to save stitched model to {output_path}")
-
-    return output_path
-
-
-def stitch_two_ply_files(source_path: str, target_path: str, output_path: str, gap: float = 1.0) -> str:
-    #keep the old app function name, but route it to the new side-by-side stitch code
-    return place_objects_side_by_side(source_path, target_path, output_path, gap=gap)
-
-
-def stitch_multiple_ply_files(input_paths: List[str], output_path: str, gap: float = 1.0) -> str:
-    #run the new side-by-side stitch repeatedly so any number of selected scans can be combined
-    if len(input_paths) < 2:
-        raise ValueError("select at least 2 .ply scans to stitch")
-
-    ordered_paths = [str(Path(p)) for p in input_paths]
-    with tempfile.TemporaryDirectory(prefix="lidar_stitch_") as temp_dir:
-        running_path = ordered_paths[0]
-
-        for index, next_path in enumerate(ordered_paths[1:], start=1):
-            is_last_merge = index == (len(ordered_paths) - 1)
-            current_output = output_path if is_last_merge else str(Path(temp_dir) / f"partial_merge_{index}.ply")
-            place_objects_side_by_side(
-                source_path=next_path,
-                target_path=running_path,
-                output_path=current_output,
-                gap=gap,
-            )
-            running_path = current_output
-
-    return output_path
-
-
-class StitchWorker(QThread):
-    #emits the final stitched file path
-    finished_success = pyqtSignal(str)
-    #thread-safe logs to the ui
-    log = pyqtSignal(str)
-    #thread-safe stitch failure reporting
-    error = pyqtSignal(str)
-
-    def __init__(self, input_paths: List[str], output_path: str, gap: float = 1.0, parent=None):
-        super().__init__(parent)
-        self.input_paths = input_paths
-        self.output_path = output_path
-        self.gap = max(0.0, float(gap))
-
-    def run(self):
-        #run the new side-by-side stitch code using the selected queue items
-        try:
-            self.log.emit(f"[stitch] stitching {len(self.input_paths)} selected file(s)...")
-            self.log.emit(f"[stitch] mode: side-by-side placement | gap={self.gap:g}")
-            for idx, path in enumerate(self.input_paths, start=1):
-                self.log.emit(f"[stitch] {idx}. {os.path.basename(path)}")
-
-            final_output = stitch_multiple_ply_files(self.input_paths, self.output_path, gap=self.gap)
-
-            if not os.path.exists(final_output):
-                raise FileNotFoundError(
-                    "stitching finished but no output .ply file was found on disk."
-                )
-
-            self.log.emit(f"[stitch] stitched file created: {os.path.basename(final_output)}")
-            self.finished_success.emit(final_output)
-
-        except Exception as e:
-            self.error.emit(f"[stitch] failed: {e}")
-#===== SECTION 5B: STITCHING HELPERS END POINT =====
+#===== SECTION 5B: VIEWER COLOR HELPERS END POINT =====
 
 def build_dark_app_stylesheet() -> str:
     #dark ui theme so controls match the black viewer background
@@ -1370,7 +1203,7 @@ def build_dark_app_stylesheet() -> str:
     """
 
 
-#===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) START POINT =====
+#===== SECTION 6: 3D VIEWPORT (OBJECT VIEWER) START POINT =====
 class MultiPLYViewport(gl.GLViewWidget):
     point_count_changed = pyqtSignal(int)
 
@@ -1385,7 +1218,7 @@ class MultiPLYViewport(gl.GLViewWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCameraPosition(distance=85, elevation=18, azimuth=45)
 
-        #keep a dark viewport background for stronger point-cloud contrast
+        #keep a dark viewport background for stronger object contrast
         try:
             self.setBackgroundColor("k")
         except Exception:
@@ -1393,26 +1226,60 @@ class MultiPLYViewport(gl.GLViewWidget):
 
         layout.addWidget(self)
 
-        #add point cloud objects into array
+        #each loaded ply becomes its own render object
         self.point_cloud_items = []
         self.selected_index = -1
 
-        #floor plane that sits under the visible cloud
+        #floor plane that sits under the selected object
         self.floor_plane_item = gl.GLGridItem()
         self.floor_plane_item.setSpacing(x=1.0, y=1.0)
         self.addItem(self.floor_plane_item)
 
-        #track loaded point-cloud state so viewer-only filters can be toggled on and off
         self.file_loaded = False
-        self._raw_pos = np.zeros((0, 3), dtype=np.float32)
-        self._raw_color = np.zeros((0, 4), dtype=np.float32)
-        self._fit_scale = 1.0
-        self._display_distance = 25.0
         self.hide_ceiling_enabled = False
-        self._ceiling_cut_height = None
+        self._display_distance = 25.0
+
+    def _selected_item(self):
+        #return the currently selected render object
+        if not self.point_cloud_items:
+            return None
+        if self.selected_index < 0 or self.selected_index >= len(self.point_cloud_items):
+            self.selected_index = len(self.point_cloud_items) - 1
+        return self.point_cloud_items[self.selected_index]
+
+    def _visible_object_data(self, item):
+        #read the object's own stored data and apply viewer-only filters
+        data = getattr(item, "userData", {}) or {}
+        pos = np.asarray(data.get("raw_pos", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+        color = np.asarray(data.get("raw_color", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)
+        ceiling_cut = data.get("ceiling_cut_height")
+
+        if len(pos) == 0:
+            return pos, color
+
+        if len(color) != len(pos):
+            color = build_height_colors_rgba(pos).astype(np.float32)
+
+        if self.hide_ceiling_enabled and ceiling_cut is not None:
+            keep = pos[:, 2] < float(ceiling_cut)
+            if int(np.count_nonzero(keep)) >= max(100, int(len(pos) * 0.55)):
+                pos = pos[keep]
+                color = color[keep]
+
+        return pos, color
+
+    def _object_local_points(self, item, pos: np.ndarray) -> np.ndarray:
+        #convert one object's raw points into its local render coordinates
+        data = getattr(item, "userData", {}) or {}
+        if len(pos) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        center = np.asarray(data.get("center", pos.mean(axis=0)), dtype=np.float32)
+        fit_scale = float(data.get("fit_scale", 1.0))
+        return ((pos - center) * fit_scale).astype(np.float32)
 
     def _update_floor_plane(self, pos_local: np.ndarray):
-        #resize and place the floor plane so the cloud appears to sit on top of it
+        #resize and place the floor plane under the selected object only
         if len(pos_local) == 0:
             self.floor_plane_item.resetTransform()
             self.floor_plane_item.setSize(x=1.0, y=1.0)
@@ -1436,43 +1303,36 @@ class MultiPLYViewport(gl.GLViewWidget):
         self.floor_plane_item.translate(center_x, center_y, floor_z)
 
     def _refresh_display(self):
-        #redraw the viewer using the current hide-ceiling toggle without touching the underlying file
-        if len(self._raw_pos) == 0:
-            self.point_cloud_item.setData(pos=np.zeros((0, 3), dtype=np.float32))
+        #redraw each render object from its own stored data without overwriting other objects
+        if not self.point_cloud_items:
             self.floor_plane_item.resetTransform()
             self.floor_plane_item.setSize(x=1.0, y=1.0)
             self.file_loaded = False
             self.point_count_changed.emit(0)
             return
 
-        pos = self._raw_pos
-        color = self._raw_color
-        if self.hide_ceiling_enabled and self._ceiling_cut_height is not None:
-            keep = pos[:, 2] < float(self._ceiling_cut_height)
-            if int(np.count_nonzero(keep)) >= max(100, int(len(pos) * 0.55)):
-                pos = pos[keep]
-                color = color[keep]
+        total_visible_points = 0
+        selected_local = np.zeros((0, 3), dtype=np.float32)
 
-        mins = pos.min(axis=0)
-        maxs = pos.max(axis=0)
-        center = (mins + maxs) / 2.0
-        pos_local = (pos - center) * self._fit_scale
+        for index, item in enumerate(self.point_cloud_items):
+            pos, color = self._visible_object_data(item)
+            pos_local = self._object_local_points(item, pos)
+            item.setData(
+                pos=pos_local.astype(np.float32),
+                color=color.astype(np.float32),
+                size=3.5,
+                pxMode=True
+            )
+            total_visible_points += int(len(pos_local))
+            if index == self.selected_index:
+                selected_local = pos_local
 
-        #iterate each object to refresh
-        for item in self.point_cloud_items:
-            item.setData(pos=pos_local.astype(np.float32),
-                 color=color.astype(np.float32),
-                 size=3.5,
-                 pxMode=True)
-            
-        self._update_floor_plane(pos_local)
-
+        self._update_floor_plane(selected_local)
         self.file_loaded = True
-        self.setCameraPosition(distance=self._display_distance, elevation=18, azimuth=45)
-        self.point_count_changed.emit(int(len(pos)))
+        self.point_count_changed.emit(total_visible_points)
 
     def set_hide_ceiling(self, enabled: bool):
-        #toggle viewer-only ceiling hiding for the currently loaded scan
+        #toggle viewer-only ceiling hiding for every loaded object
         self.hide_ceiling_enabled = bool(enabled)
         self._refresh_display()
 
@@ -1481,11 +1341,11 @@ class MultiPLYViewport(gl.GLViewWidget):
         self.setCameraPosition(distance=self._display_distance, elevation=90, azimuth=0)
 
     def set_left_view(self):
-        #snap camera to the left side of the scan
+        #snap camera to the left side of the object
         self.setCameraPosition(distance=self._display_distance, elevation=0, azimuth=180)
 
     def set_right_view(self):
-        #snap camera to the right side of the scan
+        #snap camera to the right side of the object
         self.setCameraPosition(distance=self._display_distance, elevation=0, azimuth=0)
 
     def set_bottom_view(self):
@@ -1497,111 +1357,188 @@ class MultiPLYViewport(gl.GLViewWidget):
             self.removeItem(item)
         self.point_cloud_items = []
         self.selected_index = -1
+        self.file_loaded = False
+        self._refresh_display()
 
     def load_ply(self, path: str, append=False):
-        #load one ply, fit it into view, and replace the current scan
+        #load one ply as its own object in the viewer
         data = read_ply_data(path)
         pos = data["xyz"]
-        color = build_height_colors_rgba(pos).astype(np.float32)
 
         if pos.size == 0:
             raise ValueError("ply contains no vertices")
 
+        color = build_height_colors_rgba(pos).astype(np.float32)
+
         span = pos.max(axis=0) - pos.min(axis=0)
         max_span = float(np.max(span)) if float(np.max(span)) > 0 else 1.0
-        self._fit_scale = 25.0 / max_span
-        self._display_distance = max(25.0, max_span * self._fit_scale * 2.5)
-        self._raw_pos = pos.astype(np.float32)
-        self._raw_color = color
-        self._ceiling_cut_height = estimate_ceiling_cut_height(pos[:, 2])
+        fit_scale = 25.0 / max_span
+        self._display_distance = max(25.0, max_span * fit_scale * 2.5)
 
-        #create and add object to list
-        self.setData(pos, color, append=append)
+        self.setData(
+            pos=pos.astype(np.float32),
+            color=color,
+            append=append,
+            source_path=path,
+            fit_scale=fit_scale,
+        )
 
-    def setData(self,pos,color,append=False):
-
+    def setData(self, pos, color, append=False, source_path=None, fit_scale=1.0):
+        #create a new render object instead of treating every load as one point cloud
         if not append:
             self.clear_view()
 
-        center = pos.mean(axis=0) #center new cloud item
-        pos_centered = pos - center
+        pos = np.asarray(pos, dtype=np.float32)
+        color = np.asarray(color, dtype=np.float32)
+        center = pos.mean(axis=0)
+        pos_scaled = (pos - center) * float(fit_scale)
 
-        pos_scaled = pos_centered * self._fit_scale #scale to fit viewport
-
-        #create new cloud item
         new_cloud = gl.GLScatterPlotItem(
-            pos=pos_scaled.astype(np.float32), 
-            color=color, 
-            size=3.5, 
+            pos=pos_scaled.astype(np.float32),
+            color=color,
+            size=3.5,
             pxMode=True
         )
-        new_cloud.setGLOptions('opaque')
+        new_cloud.setGLOptions("opaque")
 
-        #store data for filtering later
-        new_cloud.userData = {'raw_pos': pos , 'raw_color': color}
+        new_cloud.userData = {
+            "raw_pos": pos.copy(),
+            "raw_color": color.copy(),
+            "center": center.astype(np.float32),
+            "fit_scale": float(fit_scale),
+            "source_path": source_path,
+            "ceiling_cut_height": estimate_ceiling_cut_height(pos[:, 2]),
+        }
 
         self.addItem(new_cloud)
         self.point_cloud_items.append(new_cloud)
 
-        #select most recently added cloud
         self.selected_index = len(self.point_cloud_items) - 1
         self.file_loaded = True
         self.setFocus()
-        self.point_count_changed.emit(len(pos))
         self._refresh_display()
+        self.setCameraPosition(distance=self._display_distance, elevation=18, azimuth=45)
 
-    def keyPressEvent(self,event):
+    def flip_selected_object_180(self):
+        #flip only the selected rendered object, not the file or every point cloud
+        target = self._selected_item()
+        if target is None:
+            return False
+        target.rotate(180, 1, 0, 0)
+        self.setFocus()
+        return True
+
+    def cleanup_selected_object(self):
+        #clean only the selected object's stored point data and redraw that object
+        target = self._selected_item()
+        if target is None:
+            return 0, 0
+
+        data = getattr(target, "userData", {}) or {}
+        xyz = np.asarray(data.get("raw_pos", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+        color = np.asarray(data.get("raw_color", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)
+
+        if len(xyz) == 0:
+            return 0, 0
+
+        before_count = int(len(xyz))
+        cleaned_xyz, _, _ = statistical_outlier_filter_numpy(
+            xyz,
+            rgb=None,
+            intensity=None,
+            k=10,
+            z_thresh=1.8,
+        )
+
+        if len(cleaned_xyz) == 0 or len(cleaned_xyz) >= len(xyz):
+            return before_count, before_count
+
+        keep_lookup = set(map(tuple, np.round(cleaned_xyz.astype(np.float64), 6)))
+        rounded_xyz = np.round(xyz.astype(np.float64), 6)
+        keep_mask = np.array([tuple(row) in keep_lookup for row in rounded_xyz], dtype=bool)
+
+        #fallback in case duplicate/rounded points make the lookup too strict
+        if int(np.count_nonzero(keep_mask)) < max(10, int(len(cleaned_xyz) * 0.75)):
+            keep_mask = np.ones(len(xyz), dtype=bool)
+            keep_mask[:len(cleaned_xyz)] = False
+            keep_mask = ~keep_mask
+
+        new_xyz = xyz[keep_mask]
+        if len(color) == len(xyz):
+            new_color = color[keep_mask]
+        else:
+            new_color = build_height_colors_rgba(new_xyz).astype(np.float32)
+
+        data["raw_pos"] = new_xyz.astype(np.float32)
+        data["raw_color"] = new_color.astype(np.float32)
+        data["center"] = new_xyz.mean(axis=0).astype(np.float32)
+        data["ceiling_cut_height"] = estimate_ceiling_cut_height(new_xyz[:, 2])
+        target.userData = data
+
+        self._refresh_display()
+        self.setFocus()
+        return before_count, int(len(new_xyz))
+
+    def select_next_object(self):
+        #cycle which rendered object receives object controls
+        if not self.point_cloud_items:
+            return -1
+        self.selected_index = (self.selected_index + 1) % len(self.point_cloud_items)
+        self._refresh_display()
+        self.setFocus()
+        return self.selected_index
+
+    def keyPressEvent(self, event):
         self.setFocus()
 
-        if not self.point_cloud_items or self.selected_index == -1:
+        target = self._selected_item()
+        if target is None:
             super().keyPressEvent(event)
             return
 
-        target = self.point_cloud_items[self.selected_index]
-        step = 5  # Distance to move per key press
+        step = 5
 
-        # X-Axis (A/D)
+        #object translation
         if event.key() == Qt.Key.Key_A:
             target.translate(-step, 0, 0)
         elif event.key() == Qt.Key.Key_D:
             target.translate(step, 0, 0)
-        
-        # Y-Axis (W/S)
         elif event.key() == Qt.Key.Key_W:
             target.translate(0, step, 0)
         elif event.key() == Qt.Key.Key_S:
             target.translate(0, -step, 0)
-            
-        # Z-Axis (Q/E)
         elif event.key() == Qt.Key.Key_Q:
             target.translate(0, 0, step)
         elif event.key() == Qt.Key.Key_E:
             target.translate(0, 0, -step)
 
-        # Rotation (R/T)
+        #object rotation
         elif event.key() == Qt.Key.Key_R:
-            target.rotate(5,0,0,1)
+            target.rotate(5, 0, 0, 1)
         elif event.key() == Qt.Key.Key_T:
-            target.rotate(-5,0,0,1)
+            target.rotate(-5, 0, 0, 1)
 
-        # Cycle Selection (F)
+        #cycle selected render object
         elif event.key() == Qt.Key.Key_F:
-            self.selected_index = (self.selected_index + 1) % len(self.point_cloud_items)
-        super().keyPressEvent(event)
+            self.select_next_object()
+        else:
+            super().keyPressEvent(event)
+            return
 
-#===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) END POINT =====
+        self.setFocus()
+
+#===== SECTION 6: 3D VIEWPORT (OBJECT VIEWER) END POINT =====
 
 #===== SECTION 7: MAIN WINDOW (UI + APP LOGIC) START POINT =====
 class LidarWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("LIDAR Image Generation & Stitching")
+        self.setWindowTitle("LIDAR Image Generation")
         self.setGeometry(250, 250, 1100, 650)
 
         self._closing = False
         self.current_loaded_path: Optional[str] = None
-        self.stitch_worker: Optional[StitchWorker] = None
         self.hide_ceiling_enabled = False
 
         #===== SECTION 8: UI CREATION START POINT =====
@@ -1708,64 +1645,23 @@ class LidarWindow(QMainWindow):
         self.scan_list.addItem(item)
 
     def _cleanup_scan_clicked(self):
-        #create an edited version of the currently loaded scan and add it back to the queue
-        if not self.current_loaded_path or not os.path.exists(self.current_loaded_path):
-            self._log("cleanup failed: load a scan first.")
+        #clean only the selected rendered object inside the viewer
+        before_count, after_count = self.viewer3d.cleanup_selected_object()
+        if before_count == 0:
+            self._log("cleanup failed: load/select an object first.")
             return
-
-        try:
-            self.progress.setRange(0, 0)
-            self._log(f"cleaning scan: {os.path.basename(self.current_loaded_path)}")
-            edited_path = cleanup_scan_to_new_file(self.current_loaded_path)
-            display_name = os.path.basename(edited_path)
-            self._add_queue_item(display_name, edited_path)
-            self._log(f"edited scan saved: {os.path.basename(edited_path)}")
-            self._load_path_into_viewer(edited_path)
-        except Exception as e:
-            self._log(f"cleanup failed: {e}")
-        finally:
-            self.progress.setRange(0, 100)
-            self.progress.setValue(0)
-
-    def _stabilize_floor_clicked(self):
-        #create a new leveled file with the detected floor placed at the bottom
-        if not self.current_loaded_path or not os.path.exists(self.current_loaded_path):
-            self._log("flooring failed: load a scan first.")
+        if before_count == after_count:
+            self._log(f"object cleanup complete: no additional outliers removed. points still visible: {after_count:,}")
             return
+        self._log(f"object cleaned: {before_count:,} -> {after_count:,} points visible.")
 
-        try:
-            self.progress.setRange(0, 0)
-            self._log(f"stabilizing floor: {os.path.basename(self.current_loaded_path)}")
-            floored_path = stabilize_floor_to_new_file(self.current_loaded_path)
-            display_name = os.path.basename(floored_path)
-            self._add_queue_item(display_name, floored_path)
-            self._log(f"floored scan saved: {os.path.basename(floored_path)}")
-            self._load_path_into_viewer(floored_path)
-        except Exception as e:
-            self._log(f"flooring failed: {e}")
-        finally:
-            self.progress.setRange(0, 100)
-            self.progress.setValue(0)
 
     def _flip_180_clicked(self):
-        #flip the currently loaded scan so a ceiling-picked floor result can be inverted quickly
-        if not self.current_loaded_path or not os.path.exists(self.current_loaded_path):
-            self._log("flip failed: load a scan first.")
-            return
-
-        try:
-            self.progress.setRange(0, 0)
-            self._log(f"flipping scan 180°: {os.path.basename(self.current_loaded_path)}")
-            flipped_path = flip_scan_180_to_new_file(self.current_loaded_path)
-            display_name = os.path.basename(flipped_path)
-            self._add_queue_item(display_name, flipped_path)
-            self._log(f"flipped scan saved: {os.path.basename(flipped_path)}")
-            self._load_path_into_viewer(flipped_path)
-        except Exception as e:
-            self._log(f"flip failed: {e}")
-        finally:
-            self.progress.setRange(0, 100)
-            self.progress.setValue(0)
+        #flip only the selected rendered object inside the viewer
+        if self.viewer3d.flip_selected_object_180():
+            self._log("selected object flipped 180°.")
+        else:
+            self._log("flip failed: load/select an object first.")
 
     def _hide_ceiling_toggled(self, checked: bool):
         #toggle viewer-only hiding of the detected ceiling slab
@@ -1840,8 +1736,6 @@ class LidarWindow(QMainWindow):
         file_btn_row.addWidget(self.btn_delete)
         left.addLayout(file_btn_row)
 
-        self.btn_stitch = QPushButton("Stitch")
-        left.addWidget(self.btn_stitch)
 
         self.btn_toggle_right = QPushButton("Hide Side Panel")
         left.addWidget(self.btn_toggle_right)
@@ -1871,9 +1765,8 @@ class LidarWindow(QMainWindow):
         render_layout.setVerticalSpacing(8)
 
         self.btn_clear_view = QPushButton("Clear Viewer")
-        self.btn_floor_scan = QPushButton("Stabilize Floor")
-        self.btn_flip_180 = QPushButton("Flip 180°")
-        self.btn_cleanup_scan = QPushButton("Clean Up Scan")
+        self.btn_flip_180 = QPushButton("Flip Selected Object 180°")
+        self.btn_cleanup_scan = QPushButton("Clean Selected Object")
         self.btn_top_view = QPushButton("Top View")
         self.btn_left_view = QPushButton("Left Side View")
         self.btn_right_view = QPushButton("Right Side View")
@@ -1882,7 +1775,6 @@ class LidarWindow(QMainWindow):
 
         right_buttons = [
             self.btn_clear_view,
-            self.btn_floor_scan,
             self.btn_flip_180,
             self.btn_cleanup_scan,
             self.btn_top_view,
@@ -1895,9 +1787,8 @@ class LidarWindow(QMainWindow):
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         render_layout.addWidget(self.btn_clear_view, 0, 0)
-        render_layout.addWidget(self.btn_floor_scan, 0, 1)
-        render_layout.addWidget(self.btn_flip_180, 1, 0)
-        render_layout.addWidget(self.btn_cleanup_scan, 1, 1)
+        render_layout.addWidget(self.btn_flip_180, 0, 1)
+        render_layout.addWidget(self.btn_cleanup_scan, 1, 0, 1, 2)
         render_layout.addWidget(self.hide_ceiling_chk, 2, 0, 1, 2)
         render_layout.setColumnStretch(0, 1)
         render_layout.setColumnStretch(1, 1)
@@ -1963,7 +1854,6 @@ class LidarWindow(QMainWindow):
         self.btn_delete.clicked.connect(self._delete_selected_clicked)
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_viewer)
         self.btn_clear_view.clicked.connect(self._clear_view_clicked)
-        self.btn_floor_scan.clicked.connect(self._stabilize_floor_clicked)
         self.btn_flip_180.clicked.connect(self._flip_180_clicked)
         self.btn_cleanup_scan.clicked.connect(self._cleanup_scan_clicked)
         self.btn_top_view.clicked.connect(self._top_view_clicked)
@@ -1971,64 +1861,10 @@ class LidarWindow(QMainWindow):
         self.btn_right_view.clicked.connect(self._right_view_clicked)
         self.btn_bottom_view.clicked.connect(self._bottom_view_clicked)
         self.hide_ceiling_chk.toggled.connect(self._hide_ceiling_toggled)
-        self.btn_stitch.clicked.connect(self._stitch_clicked)
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
         self.viewer3d.point_count_changed.connect(self._update_point_count_label)
         #===== SECTION 16: UI EVENTS END POINT =====
 
-    def _get_selected_queue_paths(self) -> List[str]:
-        #return valid file paths for all individually selected queue items
-        selected_paths: List[str] = []
-        for item in self.scan_list.selectedItems():
-            path = item.data(Qt.ItemDataRole.UserRole)
-            if path and os.path.exists(path):
-                selected_paths.append(path)
-        return selected_paths
-
-    def _stitch_clicked(self):
-        #run the built-in stitching algorithm on multiple selected scans
-        selected_paths = self._get_selected_queue_paths()
-        if len(selected_paths) < 2:
-            self._log("[stitch] select at least 2 scans in the queue first.")
-            QMessageBox.warning(self, "Stitch", "Select at least 2 scans in the queue before stitching.")
-            return
-
-        try:
-            output_path = build_stitched_output_path(selected_paths)
-            self._log(f"[stitch] output will be saved as: {os.path.basename(output_path)}")
-            self.progress.setRange(0, 0)
-            self.btn_stitch.setEnabled(False)
-
-            self.stitch_worker = StitchWorker(selected_paths, output_path, parent=self)
-            self.stitch_worker.log.connect(self._log)
-            self.stitch_worker.error.connect(self._on_stitch_error)
-            self.stitch_worker.finished_success.connect(self._on_stitch_success)
-            self.stitch_worker.finished.connect(self._on_stitch_finished)
-            self.stitch_worker.start()
-        except Exception as e:
-            self._log(f"[stitch] failed before worker start: {e}")
-            self.progress.setRange(0, 100)
-            self.progress.setValue(0)
-            self.btn_stitch.setEnabled(True)
-            QMessageBox.critical(self, "Stitch Failed", str(e))
-
-    def _on_stitch_success(self, stitched_path: str):
-        #add the stitched scan to the queue and load it into the viewer
-        display_name = os.path.basename(stitched_path)
-        self._add_queue_item(display_name, stitched_path)
-        self._load_path_into_viewer(stitched_path)
-        self._log(f"[stitch] success. added stitched scan: {display_name}")
-
-    def _on_stitch_error(self, msg: str):
-        #surface stitch errors to the user and the log
-        self._log(msg)
-        QMessageBox.critical(self, "Stitch Failed", msg.splitlines()[0])
-
-    def _on_stitch_finished(self):
-        #restore ui state after stitch worker exits
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.btn_stitch.setEnabled(True)
 
     def _toggle_right_panel(self):
         if self.right_panel.isVisible():
@@ -2095,13 +1931,6 @@ class LidarWindow(QMainWindow):
                 self._log("stopping receiver...")
                 self.receiver.stop()
                 self.receiver.wait(1500)
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self, "stitch_worker") and self.stitch_worker and self.stitch_worker.isRunning():
-                self._log("waiting for stitch worker to finish...")
-                self.stitch_worker.wait(1500)
         except Exception:
             pass
         super().closeEvent(event)
