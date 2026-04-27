@@ -1371,7 +1371,7 @@ def build_dark_app_stylesheet() -> str:
 
 
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) START POINT =====
-class SinglePLYViewport(QWidget):
+class MultiPLYViewport(gl.GLViewWidget):
     point_count_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
@@ -1381,27 +1381,26 @@ class SinglePLYViewport(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        #single 3d viewer for one point cloud at a time
-        self.view = gl.GLViewWidget()
-        self.view.setCameraPosition(distance=85, elevation=18, azimuth=45)
+        #set focus to recieve keyboard inputs and set initial camera position
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCameraPosition(distance=85, elevation=18, azimuth=45)
 
         #keep a dark viewport background for stronger point-cloud contrast
         try:
-            self.view.setBackgroundColor("k")
+            self.setBackgroundColor("k")
         except Exception:
-            self.view.opts["bgcolor"] = (0, 0, 0, 255)
+            self.opts["bgcolor"] = (0, 0, 0, 255)
 
-        layout.addWidget(self.view)
+        layout.addWidget(self)
 
-        #one scatter item only
-        self.point_cloud_item = gl.GLScatterPlotItem(size=3.5, pxMode=True)
-        self.point_cloud_item.setGLOptions("opaque")
-        self.view.addItem(self.point_cloud_item)
+        #add point cloud objects into array
+        self.point_cloud_items = []
+        self.selected_index = -1
 
         #floor plane that sits under the visible cloud
         self.floor_plane_item = gl.GLGridItem()
         self.floor_plane_item.setSpacing(x=1.0, y=1.0)
-        self.view.addItem(self.floor_plane_item)
+        self.addItem(self.floor_plane_item)
 
         #track loaded point-cloud state so viewer-only filters can be toggled on and off
         self.file_loaded = False
@@ -1459,17 +1458,17 @@ class SinglePLYViewport(QWidget):
         center = (mins + maxs) / 2.0
         pos_local = (pos - center) * self._fit_scale
 
-        self.point_cloud_item.setData(
-            pos=pos_local.astype(np.float32),
-            color=color.astype(np.float32),
-            size=3.5,
-            pxMode=True
-        )
-        self.point_cloud_item.setGLOptions("opaque")
+        #iterate each object to refresh
+        for item in self.point_cloud_items:
+            item.setData(pos=pos_local.astype(np.float32),
+                 color=color.astype(np.float32),
+                 size=3.5,
+                 pxMode=True)
+            
         self._update_floor_plane(pos_local)
 
         self.file_loaded = True
-        self.view.setCameraPosition(distance=self._display_distance, elevation=18, azimuth=45)
+        self.setCameraPosition(distance=self._display_distance, elevation=18, azimuth=45)
         self.point_count_changed.emit(int(len(pos)))
 
     def set_hide_ceiling(self, enabled: bool):
@@ -1479,36 +1478,32 @@ class SinglePLYViewport(QWidget):
 
     def set_top_view(self):
         #snap camera to a straight top-down view
-        self.view.setCameraPosition(distance=self._display_distance, elevation=90, azimuth=0)
+        self.setCameraPosition(distance=self._display_distance, elevation=90, azimuth=0)
 
     def set_left_view(self):
         #snap camera to the left side of the scan
-        self.view.setCameraPosition(distance=self._display_distance, elevation=0, azimuth=180)
+        self.setCameraPosition(distance=self._display_distance, elevation=0, azimuth=180)
 
     def set_right_view(self):
         #snap camera to the right side of the scan
-        self.view.setCameraPosition(distance=self._display_distance, elevation=0, azimuth=0)
+        self.setCameraPosition(distance=self._display_distance, elevation=0, azimuth=0)
 
     def set_bottom_view(self):
         #snap camera to a straight bottom-up view
-        self.view.setCameraPosition(distance=self._display_distance, elevation=-90, azimuth=0)
+        self.setCameraPosition(distance=self._display_distance, elevation=-90, azimuth=0)
 
     def clear_view(self):
-        #wipe the current point cloud from the viewer
-        self._raw_pos = np.zeros((0, 3), dtype=np.float32)
-        self._raw_color = np.zeros((0, 4), dtype=np.float32)
-        self._ceiling_cut_height = None
-        self.hide_ceiling_enabled = False
-        self.point_cloud_item.setData(pos=np.zeros((0, 3), dtype=np.float32))
-        self.floor_plane_item.resetTransform()
-        self.floor_plane_item.setSize(x=1.0, y=1.0)
-        self.file_loaded = False
-        self.point_count_changed.emit(0)
+        for item in self.point_cloud_items:
+            self.removeItem(item)
+        self.point_cloud_items = []
+        self.selected_index = -1
 
-    def load_ply(self, path: str):
+    def load_ply(self, path: str, append=False):
         #load one ply, fit it into view, and replace the current scan
         data = read_ply_data(path)
         pos = data["xyz"]
+        color = build_height_colors_rgba(pos).astype(np.float32)
+
         if pos.size == 0:
             raise ValueError("ply contains no vertices")
 
@@ -1517,9 +1512,82 @@ class SinglePLYViewport(QWidget):
         self._fit_scale = 25.0 / max_span
         self._display_distance = max(25.0, max_span * self._fit_scale * 2.5)
         self._raw_pos = pos.astype(np.float32)
-        self._raw_color = build_height_colors_rgba(pos).astype(np.float32)
+        self._raw_color = color
         self._ceiling_cut_height = estimate_ceiling_cut_height(pos[:, 2])
+
+        #create and add object to list
+        self.setData(pos, color, append=append)
+
+    def setData(self,pos,color,append=False):
+
+        if not append:
+            self.clear_view()
+
+        center = pos.mean(axis=0) #center new cloud item
+        pos_centered = pos - center
+
+        pos_scaled = pos_centered * self._fit_scale #scale to fit viewport
+
+        #create new cloud item
+        new_cloud = gl.GLScatterPlotItem(
+            pos=pos_scaled.astype(np.float32), 
+            color=color, 
+            size=3.5, 
+            pxMode=True
+        )
+        new_cloud.setGLOptions('opaque')
+
+        #store data for filtering later
+        new_cloud.userData = {'raw_pos': pos , 'raw_color': color}
+
+        self.addItem(new_cloud)
+        self.point_cloud_items.append(new_cloud)
+
+        #select most recently added cloud
+        self.selected_index = len(self.point_cloud_items) - 1
+        self.file_loaded = True
+        self.setFocus()
+        self.point_count_changed.emit(len(pos))
         self._refresh_display()
+
+    def keyPressEvent(self,event):
+        self.setFocus()
+
+        if not self.point_cloud_items or self.selected_index == -1:
+            super().keyPressEvent(event)
+            return
+
+        target = self.point_cloud_items[self.selected_index]
+        step = 5  # Distance to move per key press
+
+        # X-Axis (A/D)
+        if event.key() == Qt.Key.Key_A:
+            target.translate(-step, 0, 0)
+        elif event.key() == Qt.Key.Key_D:
+            target.translate(step, 0, 0)
+        
+        # Y-Axis (W/S)
+        elif event.key() == Qt.Key.Key_W:
+            target.translate(0, step, 0)
+        elif event.key() == Qt.Key.Key_S:
+            target.translate(0, -step, 0)
+            
+        # Z-Axis (Q/E)
+        elif event.key() == Qt.Key.Key_Q:
+            target.translate(0, 0, step)
+        elif event.key() == Qt.Key.Key_E:
+            target.translate(0, 0, -step)
+
+        # Rotation (R/T)
+        elif event.key() == Qt.Key.Key_R:
+            target.rotate(5,0,0,1)
+        elif event.key() == Qt.Key.Key_T:
+            target.rotate(-5,0,0,1)
+
+        # Cycle Selection (F)
+        elif event.key() == Qt.Key.Key_F:
+            self.selected_index = (self.selected_index + 1) % len(self.point_cloud_items)
+        super().keyPressEvent(event)
 
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) END POINT =====
 
@@ -1618,7 +1686,7 @@ class LidarWindow(QMainWindow):
 
     def _load_path_into_viewer(self, path: str):
         try:
-            self.viewer3d.load_ply(path)
+            self.viewer3d.load_ply(path, append=True)
             self.current_loaded_path = path
             self._log(f"loaded scan: {os.path.basename(path)}")
             self.info_lbl.setText(f"Loaded:\n{os.path.basename(path)}")
@@ -1784,7 +1852,7 @@ class LidarWindow(QMainWindow):
         center.setSpacing(8)
         main_layout.addLayout(center, 4)
 
-        self.viewer3d = SinglePLYViewport()
+        self.viewer3d = MultiPLYViewport()
         center.addWidget(self.viewer3d, 1)
 
         #===== SECTION 14: CENTER COLUMN (3D VIEW) END POINT =====
