@@ -11,9 +11,18 @@ Files:
 The files that go on the users laptop are: Interface.py, //stitch.py, 
 The files that go in the Raspberry pi are: mylovox.py, test_lidar.py, sender.py
 interface.py: this file is the window that is opened on the users laptop. this interfcae is what lets the user view the .ply file and edit/stitch the files. It is the whole UI and the only file that needs to be on the users computer/laptop.
-myLivox360.py: this file reads the output from the LiDAR scanner and displays a live visual of the generated point cloud.
+myLivox360.py: this file reads the output from the LiDAR scanner and displays a live visual of the generated point cloud. Edit the point density and distance with udp and max_distance.
 sender.py: this file lets the raspberry pi send the resulting .ply file from the lidar to the users laptop.
 test_lidar: this file is what makes the live display from myLivox360.py stop and send a snapshot of what is currently scanned. this is then saved as a .ply file in the outgoing files folder.
-//stitch.py: this file ...
+stitch.py: this file is a place holder for it to be merged into interface.py
+
+DOWNLOADING
+On your computer:
+interface.py
+In a folder to put on the Raspberry PI:
+myLivox360.py
+sender.py
+senderConfig.ini
+test_lidar.py
 
 edit the point density and distance with udp and max_distance in mylivox360.
