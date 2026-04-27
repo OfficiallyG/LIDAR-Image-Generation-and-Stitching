@@ -26,11 +26,18 @@ test_lidar: this file is what makes the live display from myLivox360.py stop and
 stitch.py: this file is a place holder for it to be merged into interface.py
 
 DOWNLOADING
+
 On your computer:
+
 interface.py
+
 In a folder to put on the Raspberry PI:
+
 myLivox360.py
+
 sender.py
+
 senderConfig.ini
+
 test_lidar.py
 
