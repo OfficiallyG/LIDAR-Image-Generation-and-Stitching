@@ -1230,9 +1230,17 @@ class MultiPLYViewport(gl.GLViewWidget):
         self.point_cloud_items = []
         self.selected_index = -1
 
-        #floor plane that sits under the selected object
+        #fixed floor grid stays still while objects/point clouds move across it
+        #grid size is allowed to match the true scan scale, but object movement stays separate from the plane
+        self.fixed_floor_grid_min_size = 80.0
+        self.fixed_floor_grid_size = self.fixed_floor_grid_min_size
+        self.fixed_floor_grid_spacing = 5.0
+        self.fixed_floor_grid_z = -3.0
+
         self.floor_plane_item = gl.GLGridItem()
-        self.floor_plane_item.setSpacing(x=1.0, y=1.0)
+        self.floor_plane_item.setSize(x=self.fixed_floor_grid_size, y=self.fixed_floor_grid_size)
+        self.floor_plane_item.setSpacing(x=self.fixed_floor_grid_spacing, y=self.fixed_floor_grid_spacing)
+        self.floor_plane_item.translate(0, 0, self.fixed_floor_grid_z)
         self.addItem(self.floor_plane_item)
 
         self.file_loaded = False
@@ -1270,51 +1278,66 @@ class MultiPLYViewport(gl.GLViewWidget):
 
     def _object_local_points(self, item, pos: np.ndarray) -> np.ndarray:
         #convert one object's raw points into its local render coordinates
+        #important: keep true scan size by centering for object pivot only, never scaling the room
         data = getattr(item, "userData", {}) or {}
         if len(pos) == 0:
             return np.zeros((0, 3), dtype=np.float32)
 
         center = np.asarray(data.get("center", pos.mean(axis=0)), dtype=np.float32)
-        fit_scale = float(data.get("fit_scale", 1.0))
-        return ((pos - center) * fit_scale).astype(np.float32)
+        return (pos - center).astype(np.float32)
 
-    def _update_floor_plane(self, pos_local: np.ndarray):
-        #resize and place the floor plane under the selected object only
-        if len(pos_local) == 0:
-            self.floor_plane_item.resetTransform()
-            self.floor_plane_item.setSize(x=1.0, y=1.0)
-            return
+    def _update_floor_plane(self, pos_local: np.ndarray = None):
+        #keep the floor grid fixed in world space, but size/lower it to match true-scale loaded scans
+        scene_chunks = []
 
-        mins = pos_local.min(axis=0)
-        maxs = pos_local.max(axis=0)
+        if pos_local is not None and len(pos_local) > 0:
+            scene_chunks.append(np.asarray(pos_local, dtype=np.float32))
+        else:
+            for item in self.point_cloud_items:
+                pos, _ = self._visible_object_data(item)
+                local = self._object_local_points(item, pos)
+                if len(local) > 0:
+                    scene_chunks.append(local)
 
-        span_x = max(float(maxs[0] - mins[0]), 4.0)
-        span_y = max(float(maxs[1] - mins[1]), 4.0)
-        floor_z = float(mins[2]) - 0.02
+        if scene_chunks:
+            scene_pos = np.vstack(scene_chunks).astype(np.float32)
+            mins = scene_pos.min(axis=0)
+            maxs = scene_pos.max(axis=0)
+            spans = np.maximum(maxs - mins, 1e-6)
 
-        center_x = float((mins[0] + maxs[0]) / 2.0)
-        center_y = float((mins[1] + maxs[1]) / 2.0)
+            xy_span = float(max(spans[0], spans[1]))
+            z_span = float(spans[2])
+
+            #make the plane big enough for the current true-scale scan plus extra room around it
+            self.fixed_floor_grid_size = float(max(self.fixed_floor_grid_min_size, xy_span * 0.97))
+
+            #lower the plane just under the bottom of the scan instead of cutting through the room
+            floor_margin = float(np.clip(z_span * 0.035, 0.50, 6.0))
+            self.fixed_floor_grid_z = float(mins[2] - floor_margin)
+
+            #spacing scales with the plane so the grid stays readable instead of becoming a black block
+            self.fixed_floor_grid_spacing = float(np.clip(self.fixed_floor_grid_size / 32.0, 4.0, 40.0))
+        else:
+            self.fixed_floor_grid_size = self.fixed_floor_grid_min_size
+            self.fixed_floor_grid_spacing = 5.0
+            self.fixed_floor_grid_z = -3.0
 
         self.floor_plane_item.resetTransform()
-        self.floor_plane_item.setSize(x=span_x * 1.15, y=span_y * 1.15)
-
-        spacing = max(min(span_x, span_y) / 20.0, 0.5)
-        self.floor_plane_item.setSpacing(x=spacing, y=spacing)
-        self.floor_plane_item.translate(center_x, center_y, floor_z)
+        self.floor_plane_item.setSize(x=self.fixed_floor_grid_size, y=self.fixed_floor_grid_size)
+        self.floor_plane_item.setSpacing(x=self.fixed_floor_grid_spacing, y=self.fixed_floor_grid_spacing)
+        self.floor_plane_item.translate(0, 0, self.fixed_floor_grid_z)
 
     def _refresh_display(self):
         #redraw each render object from its own stored data without overwriting other objects
         if not self.point_cloud_items:
-            self.floor_plane_item.resetTransform()
-            self.floor_plane_item.setSize(x=1.0, y=1.0)
+            self._update_floor_plane()
             self.file_loaded = False
             self.point_count_changed.emit(0)
             return
 
         total_visible_points = 0
-        selected_local = np.zeros((0, 3), dtype=np.float32)
 
-        for index, item in enumerate(self.point_cloud_items):
+        for item in self.point_cloud_items:
             pos, color = self._visible_object_data(item)
             pos_local = self._object_local_points(item, pos)
             item.setData(
@@ -1324,10 +1347,8 @@ class MultiPLYViewport(gl.GLViewWidget):
                 pxMode=True
             )
             total_visible_points += int(len(pos_local))
-            if index == self.selected_index:
-                selected_local = pos_local
 
-        self._update_floor_plane(selected_local)
+        self._update_floor_plane()
         self.file_loaded = True
         self.point_count_changed.emit(total_visible_points)
 
@@ -1372,29 +1393,30 @@ class MultiPLYViewport(gl.GLViewWidget):
 
         span = pos.max(axis=0) - pos.min(axis=0)
         max_span = float(np.max(span)) if float(np.max(span)) > 0 else 1.0
-        fit_scale = 25.0 / max_span
-        self._display_distance = max(25.0, max_span * fit_scale * 2.5)
+
+        #keep actual point-cloud scale; only move the camera farther back for larger scans
+        self._display_distance = max(85.0, max_span * 2.5)
 
         self.setData(
             pos=pos.astype(np.float32),
             color=color,
             append=append,
             source_path=path,
-            fit_scale=fit_scale,
         )
 
-    def setData(self, pos, color, append=False, source_path=None, fit_scale=1.0):
+    def setData(self, pos, color, append=False, source_path=None):
         #create a new render object instead of treating every load as one point cloud
+        #the object is centered for rotation/movement, but point spacing and room size stay true to the ply data
         if not append:
             self.clear_view()
 
         pos = np.asarray(pos, dtype=np.float32)
         color = np.asarray(color, dtype=np.float32)
         center = pos.mean(axis=0)
-        pos_scaled = (pos - center) * float(fit_scale)
+        pos_local = (pos - center).astype(np.float32)
 
         new_cloud = gl.GLScatterPlotItem(
-            pos=pos_scaled.astype(np.float32),
+            pos=pos_local,
             color=color,
             size=3.5,
             pxMode=True
@@ -1405,7 +1427,6 @@ class MultiPLYViewport(gl.GLViewWidget):
             "raw_pos": pos.copy(),
             "raw_color": color.copy(),
             "center": center.astype(np.float32),
-            "fit_scale": float(fit_scale),
             "source_path": source_path,
             "ceiling_cut_height": estimate_ceiling_cut_height(pos[:, 2]),
         }
