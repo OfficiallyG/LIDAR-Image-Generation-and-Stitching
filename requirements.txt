@@ -15,7 +15,7 @@ matplotlib>=3.3.0
 opencv-python-headless>=4.5.0
 
 # ===== LAPTOP SPECIFIC (for interface.py and stitch.py) =====
-Uncomment these lines if running on your laptop/desktop
+# Uncomment these lines if running on your laptop/desktop
 PyQt6>=6.0.0
 PyQt6-Qt6>=6.0.0
 pyqtgraph>=0.12.0
