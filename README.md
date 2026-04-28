@@ -11,7 +11,7 @@ Files:
 4. test_lidar.py
 5. stitch.py
 
-The files that go on the users laptop are: Interface.py, //stitch.py, 
+The files that go on the users laptop are: Interface.py
 
 The files that go in the Raspberry pi are: mylovox.py, test_lidar.py, sender.py
 
