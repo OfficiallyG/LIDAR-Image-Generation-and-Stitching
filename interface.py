@@ -1373,13 +1373,26 @@ class MultiPLYViewport(gl.GLViewWidget):
         #snap camera to a straight bottom-up view
         self.setCameraPosition(distance=self._display_distance, elevation=-90, azimuth=0)
 
-    def clear_view(self):
+    def clear_all(self):
         for item in self.point_cloud_items:
             self.removeItem(item)
         self.point_cloud_items = []
         self.selected_index = -1
         self.file_loaded = False
         self._refresh_display()
+
+    def clear_single(self):
+        if self.selected_index < 0:
+            return
+        
+        item = self.point_cloud_items[self.selected_index]
+
+        self.removeItem(item)
+        self.point_cloud_items.pop(self.selected_index)
+
+        self.selected_index = len(self.point_cloud_items) - 1
+        self._refresh_display()
+
 
     def load_ply(self, path: str, append=False):
         #load one ply as its own object in the viewer
@@ -1408,7 +1421,7 @@ class MultiPLYViewport(gl.GLViewWidget):
         #create a new render object instead of treating every load as one point cloud
         #the object is centered for rotation/movement, but point spacing and room size stay true to the ply data
         if not append:
-            self.clear_view()
+            self.clear_all()
 
         pos = np.asarray(pos, dtype=np.float32)
         color = np.asarray(color, dtype=np.float32)
@@ -1533,11 +1546,21 @@ class MultiPLYViewport(gl.GLViewWidget):
         elif event.key() == Qt.Key.Key_E:
             target.translate(0, 0, -step)
 
-        #object rotation
+        # Z-axis rotation
         elif event.key() == Qt.Key.Key_R:
             target.rotate(5, 0, 0, 1)
         elif event.key() == Qt.Key.Key_T:
             target.rotate(-5, 0, 0, 1)
+        # X-axis rotation
+        elif event.key() == Qt.Key.Key_Z:
+            target.rotate(5, 1, 0, 0)
+        elif event.key() == Qt.Key.Key_X:
+            target.rotate(-5, 1, 0, 0)
+        # Y-axis rotation
+        elif event.key() == Qt.Key.Key_C:
+            target.rotate(5, 0, 1, 0)
+        elif event.key() == Qt.Key.Key_V:
+            target.rotate(-5, 0, 1, 0)
 
         #cycle selected render object
         elif event.key() == Qt.Key.Key_F:
@@ -1547,6 +1570,25 @@ class MultiPLYViewport(gl.GLViewWidget):
             return
 
         self.setFocus()
+
+    def _get_transformed_points(self, item):
+
+        raw_pos = item.userData.get("raw_pos")
+
+        if raw_pos is None or raw_pos.size == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        # Get 4x4 transform matrix from Transform3D
+        matrix = np.array(item.transform().data(), dtype=np.float32).reshape(4, 4).T
+
+        # Convert to homogeneous coordinates
+        ones = np.ones((raw_pos.shape[0], 1), dtype=np.float32)
+        pos_hom = np.hstack((raw_pos, ones))
+
+        # Apply transform
+        transformed = pos_hom @ matrix.T
+
+        return transformed[:, :3].astype(np.float32)
 
 #===== SECTION 6: 3D VIEWPORT (OBJECT VIEWER) END POINT =====
 
@@ -1753,6 +1795,8 @@ class LidarWindow(QMainWindow):
         file_btn_row = QHBoxLayout()
         self.btn_import_local = QPushButton("Import Local")
         self.btn_delete = QPushButton("Delete Selected")
+        self.btn_save = QPushButton("Save")
+        file_btn_row.addWidget(self.btn_save)
         file_btn_row.addWidget(self.btn_import_local)
         file_btn_row.addWidget(self.btn_delete)
         left.addLayout(file_btn_row)
@@ -1785,7 +1829,8 @@ class LidarWindow(QMainWindow):
         render_layout.setHorizontalSpacing(8)
         render_layout.setVerticalSpacing(8)
 
-        self.btn_clear_view = QPushButton("Clear Viewer")
+        self.btn_clear_single = QPushButton("Clear Single Scan")
+        self.btn_clear_all = QPushButton("Clear All Scans")
         self.btn_flip_180 = QPushButton("Flip Selected Object 180°")
         self.btn_cleanup_scan = QPushButton("Clean Selected Object")
         self.btn_top_view = QPushButton("Top View")
@@ -1795,7 +1840,8 @@ class LidarWindow(QMainWindow):
         self.hide_ceiling_chk = QCheckBox("Hide ceiling in viewer")
 
         right_buttons = [
-            self.btn_clear_view,
+            self.btn_clear_single,
+            self.btn_clear_all,
             self.btn_flip_180,
             self.btn_cleanup_scan,
             self.btn_top_view,
@@ -1807,9 +1853,10 @@ class LidarWindow(QMainWindow):
             btn.setMinimumHeight(36)
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        render_layout.addWidget(self.btn_clear_view, 0, 0)
-        render_layout.addWidget(self.btn_flip_180, 0, 1)
-        render_layout.addWidget(self.btn_cleanup_scan, 1, 0, 1, 2)
+        render_layout.addWidget(self.btn_clear_single, 0, 0)
+        render_layout.addWidget(self.btn_clear_all, 0, 1)
+        render_layout.addWidget(self.btn_flip_180, 1, 0)
+        render_layout.addWidget(self.btn_cleanup_scan, 1, 1)
         render_layout.addWidget(self.hide_ceiling_chk, 2, 0, 1, 2)
         render_layout.setColumnStretch(0, 1)
         render_layout.setColumnStretch(1, 1)
@@ -1874,7 +1921,9 @@ class LidarWindow(QMainWindow):
         self.btn_import_local.clicked.connect(self._import_local_clicked)
         self.btn_delete.clicked.connect(self._delete_selected_clicked)
         self.scan_list.itemDoubleClicked.connect(self._load_item_into_viewer)
-        self.btn_clear_view.clicked.connect(self._clear_view_clicked)
+        self.btn_clear_single.clicked.connect(self._clear_single_clicked)
+        self.btn_clear_all.clicked.connect(self._clear_all_clicked)
+        self.btn_save.clicked.connect(self._save_clicked)
         self.btn_flip_180.clicked.connect(self._flip_180_clicked)
         self.btn_cleanup_scan.clicked.connect(self._cleanup_scan_clicked)
         self.btn_top_view.clicked.connect(self._top_view_clicked)
@@ -1895,14 +1944,20 @@ class LidarWindow(QMainWindow):
             self.right_panel.show()
             self.btn_toggle_right.setText("Hide Side Panel")
 
-    def _clear_view_clicked(self):
-        self.viewer3d.clear_view()
+    def _clear_single_clicked(self):
+        self.viewer3d.clear_single()
         self.hide_ceiling_chk.blockSignals(True)
         self.hide_ceiling_chk.setChecked(False)
         self.hide_ceiling_chk.blockSignals(False)
         self.current_loaded_path = None
         self.info_lbl.setText("No file loaded.")
-        self._log("cleared viewer.")
+        self._log("cleared single scan.")
+
+    def _clear_all_clicked(self):
+        self.viewer3d.clear_all()
+        self.hide_ceiling_chk.blockSignals(True)
+        self.hide_ceiling_chk.setChecked(False)
+        self.hide_ceiling_chk.blockSignals(False)
 
     def _import_local_clicked(self):
         #choose one or more ply files and add them to the queue
@@ -1921,7 +1976,6 @@ class LidarWindow(QMainWindow):
             self._add_queue_item(filename, path)
             self._log(f"imported local file: {filename}")
 
-
     def _load_item_into_viewer(self, item: QListWidgetItem):
         #double-clicking a queued file loads it into the viewer
         path = item.data(Qt.ItemDataRole.UserRole)
@@ -1936,6 +1990,48 @@ class LidarWindow(QMainWindow):
             row = self.scan_list.row(item)
             self.scan_list.takeItem(row)
         self._log("deleted selected scan(s) from queue.")
+
+    def _save_clicked(self):
+
+        if not self.viewer3d.point_cloud_items:
+            self._log("No scans to save.")
+            return
+        
+        # Save file to LIDAR_Inbox
+        out_path = build_short_raw_receive_path(INBOX_DIR)
+
+        # Empty arrays for transformed points and colors
+        all_points = []
+        all_colors = []
+
+        for item in self.viewer3d.point_cloud_items:
+
+            pts = self.viewer3d._get_transformed_points(item) # get transformed points from viewer
+            if pts.size == 0:
+                continue
+
+            all_points.append(pts)
+
+            raw_color = item.userData.get("raw_color")
+            if raw_color is not None:
+                all_colors.append(raw_color)
+
+        if not all_points:
+            self._log("Nothing valid to save.")
+            return
+
+        final_xyz = np.vstack(all_points)
+
+        final_rgb = None
+        if all_colors and len(all_colors) == len(all_points):
+            final_rgb = np.vstack(all_colors)
+
+        # Write transformations to file
+        write_ply_xyzrgb_ascii(str(out_path), final_xyz, final_rgb)
+
+        # Add new manually stitched scan to queue
+        self._add_queue_item(out_path.name, str(out_path))
+        self._log(f"Stitching saved to: {out_path}")
 
     def _log(self, msg: str):
         #prepend logs with a time stamp and cap total size for responsiveness
