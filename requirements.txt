@@ -1,7 +1,7 @@
 # Core Dependencies for LIDAR-Image-Generation-and-Stitching
 # 
 # Split by deployment:
-# - Raspberry Pi (myLivox360.py, sender.py, test_lidar.py): numpy, opencv-python-headless, matplotlib, plyfile
+# - Raspberry Pi (myLivox360.py, sender.py, test_lidar.py): numpy, opencv-python, matplotlib, plyfile
 # - Laptop (interface.py, stitch.py): PyQt6, pyqtgraph, numpy, opencv-python, matplotlib, open3d, plyfile
 
 # ===== SHARED DEPENDENCIES (both Raspberry Pi and Laptop) =====
@@ -10,12 +10,10 @@ plyfile>=0.7.3
 matplotlib>=3.3.0
 
 # ===== RASPBERRY PI SPECIFIC =====
-# Use opencv-python-headless on Raspberry Pi to avoid GUI dependencies
-# If you need GUI display, use opencv-python instead
-opencv-python-headless>=4.5.0
+opencv-python>=4.5.0
 
 # ===== LAPTOP SPECIFIC (for interface.py and stitch.py) =====
-Uncomment these lines if running on your laptop/desktop
+# Uncomment these lines if running on your laptop/desktop
 PyQt6>=6.0.0
 PyQt6-Qt6>=6.0.0
 pyqtgraph>=0.12.0

@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import cv2
 import struct
 
-img_height, img_width, dist_max = 500, 500, 4000 # 500x500 pixels, 4000 cm max distance
+img_height, img_width, dist_max = 500, 500, 400 # 500x500 pixels, 400 cm max distance
 lidar_port_number = 56301
 frame_udp_count = 418
 
@@ -22,7 +22,7 @@ def network_lidar_reader(filter_func = lambda x, y, z: True):
     #join multicast group to "hear" sdk data
     group = socket.inet_aton("224.1.1.5")
 
-    iface_ip = socket.inet_aton("192.168.10.50")  # Pi eth0 IP
+    iface_ip = socket.inet_aton("192.168.1.50")  # Pi eth0 IP
     mreq = struct.pack("4s4s", group, iface_ip)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
