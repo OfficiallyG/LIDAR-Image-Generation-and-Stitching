@@ -1,38 +1,74 @@
 # LIDAR-Image-Generation-and-Stitching
-LIDAR Image Generation and Stitching project
-This Project is for the Polk County Sherrifs Department via the Capstone course at Florida Polytechnic University.
-This project has 5 files in total all of which are coded in Python.
+This Project was developed for the Polk County Sherrifs Department via the Capstone Design course at Florida Polytechnic University.
 
-Files:
+This project has 5 files in total all of which use the Python programming language.
 
-1. interface.py
-2. myLivox360.py
-3. sender.py
-4. test_lidar.py
-5. stitch.py
+## **WARNING**
 
-The files that go on the users laptop are: Interface.py
+This project was made with the **Livox Mid360** in mind and may not work with other lidar scanning devices.
 
-The files that go in the Raspberry pi are: mylovox.py, test_lidar.py, sender.py
+## Files in this repo:
 
-interface.py: this file is the window that is opened on the users laptop. this interfcae is what lets the user view the .ply file and edit/stitch the files. It is the whole UI and the only file that needs to be on the users computer/laptop.
+- **interface.py**
+- **myLivox360.py**
+- **sender.py**
+- **test_lidar.py**
 
-myLivox360.py: this file reads the output from the LiDAR scanner and displays a live visual of the generated point cloud. Edit the point density and distance with udp and max_distance.
+## Recieving laptop files: 
+- interface.py
 
-sender.py: this file lets the raspberry pi send the resulting .ply file from the lidar to the users laptop.
+## Raspberry pi Files: 
+- mylivox360.py 
+- test_lidar.py 
+- sender.py
 
-test_lidar: this file is what makes the live display from myLivox360.py stop and send a snapshot of what is currently scanned. this is then saved as a .ply file in the outgoing files folder.
+## File Descriptions
 
-stitch.py: this file is a place holder for it to be merged into interface.py
+### interface.py: 
+This file is the window that is opened on the users laptop. This interfcae is what lets the user view the .ply file and edit/stitch the files. It is the whole UI and the only file that needs to be on the users computer/laptop.
 
-DOWNLOADING
+### myLivox360.py: 
+This file reads the output from the LiDAR scanner and creates the image that will be shown in test_lidar.py. You can edit the point density and distance with udp and max_distance values.
 
-On your computer:
-interface.py
+### sender.py: 
+This file lets the Raspberry Pi send the resulting .ply file from the device to the receiving laptop.
 
-In a folder to put on the Raspberry PI:
-myLivox360.py
-sender.py
-senderConfig.ini
-test_lidar.py
+### test_lidar.py: 
+This file is what displays the live feed from the lidar and allows the user to send a snapshot of what is currently scanned. This is then saved as a .ply file in the outgoing files folder and sent to the laptop using sender.py.
+
+
+## Instructions
+Clone the repository to Raspberry pi and laptop
+
+```bash
+git clone https://github.com/OfficiallyG/LIDAR-Image-Generation-and-Stitching 
+```
+
+
+
+### Raspberry Pi setup
+
+1. Clone the [Livox SDK](github.com/Livox-SDK/Livox-SDK2) and the [Input Remapper](https://github.com/sezanzeb/input-remapper) repositories to the device.
+
+```bash
+git clone https://github.com/Livox-SDK/Livox-SDK2.git
+```
+
+```bash
+git clone https://github.com/sezanzeb/input-remapper
+```
+
+2. Follow the instructions on the Livox SDK repo to make sure lidar device is working.
+    - you may need to edit the IP address in myLivox360.py if your device doesn't match the ip in the file.
+
+**For Livox Mid360, the default device IP address is usually 192.168.1.1XX, XX being the last 2 digits of the serial number of the device.**
+
+
+
+
+
+
+### Laptop Setup
+1. Make sure Raspberry Pi device and laptop are on the same network
+
 
