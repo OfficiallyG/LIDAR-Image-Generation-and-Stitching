@@ -25,6 +25,7 @@ import numpy as np
 import pyqtgraph.opengl as gl
 #import qt core for ui constants, background thread, signals, and timers
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QPainter, QColor, QPen
 #import qt widgets for the main window and all ui controls
 from PyQt6.QtWidgets import (
     QApplication,
@@ -1473,6 +1474,11 @@ def build_dark_app_stylesheet() -> str:
     QPushButton:pressed {
         background-color: #1b1b1b;
     }
+    QPushButton:checked {
+        background-color: #7a3a00;
+        border: 1px solid #ff8800;
+        color: #ffcc88;
+    }
     QPushButton:disabled {
         color: #8c8c8c;
         background-color: #1a1a1a;
@@ -1526,9 +1532,88 @@ def build_dark_app_stylesheet() -> str:
     """
 
 
+def _points_in_polygon_2d(px: np.ndarray, py: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    #vectorized ray-casting: returns bool mask, True = inside polygon
+    inside = np.zeros(len(px), dtype=bool)
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i, 0], poly[i, 1]
+        xj, yj = poly[j, 0], poly[j, 1]
+        dy = yj - yi
+        cross = (yi > py) != (yj > py)
+        x_int = np.where(
+            np.abs(dy) > 1e-10,
+            (xj - xi) * (py - yi) / (dy + 1e-20) + xi,
+            np.full_like(px, np.inf),
+        )
+        inside ^= cross & (px < x_int)
+        j = i
+    return inside
+
+
+class LassoOverlay(QWidget):
+    lasso_finished = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+        self._points: list = []
+        self._active = False
+
+    def set_active(self, active: bool):
+        self._active = active
+        self._points = []
+        self.update()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not active)
+        self.setCursor(Qt.CursorShape.CrossCursor if active else Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event):
+        if not self._active:
+            return super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._points = [(event.position().x(), event.position().y())]
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if not self._active or not self._points:
+            return super().mouseMoveEvent(event)
+        self._points.append((event.position().x(), event.position().y()))
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if not self._active:
+            return super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            pts = list(self._points)
+            self._points = []
+            self.update()
+            if len(pts) >= 3:
+                self.lasso_finished.emit(pts)
+
+    def paintEvent(self, event):
+        if len(self._points) < 2:
+            return
+        painter = QPainter(self)
+        pen = QPen(QColor(255, 200, 0), 2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        for i in range(len(self._points) - 1):
+            x1, y1 = self._points[i]
+            x2, y2 = self._points[i + 1]
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        if len(self._points) >= 3:
+            x1, y1 = self._points[-1]
+            x2, y2 = self._points[0]
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) START POINT =====
 class SinglePLYViewport(QWidget):
     point_count_changed = pyqtSignal(int)
+    selection_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1568,6 +1653,25 @@ class SinglePLYViewport(QWidget):
         self.hide_ceiling_enabled = False
         self._ceiling_cut_height = None
 
+        #lasso selection state
+        self._selected_mask: Optional[np.ndarray] = None
+        self._display_center = np.zeros(3, dtype=np.float32)
+        self._lasso_active = False
+
+        #transparent overlay for freehand lasso drawing
+        self._lasso_overlay = LassoOverlay(self.view)
+        self._lasso_overlay.resize(self.view.size())
+        self._lasso_overlay.lasso_finished.connect(self._on_lasso_finished)
+        self._lasso_overlay.raise_()
+        self.view.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        #keep the lasso overlay covering the gl view whenever the view is resized
+        if obj is self.view and event.type() == event.Type.Resize:
+            self._lasso_overlay.setGeometry(self.view.rect())
+            self._lasso_overlay.raise_()
+        return super().eventFilter(obj, event)
+
     def _update_floor_plane(self, pos_local: np.ndarray):
         #resize and place the floor plane so the cloud appears to sit on top of it
         if len(pos_local) == 0:
@@ -1592,7 +1696,7 @@ class SinglePLYViewport(QWidget):
         self.floor_plane_item.setSpacing(x=spacing, y=spacing)
         self.floor_plane_item.translate(center_x, center_y, floor_z)
 
-    def _refresh_display(self):
+    def _refresh_display(self, reset_camera: bool = True):
         #redraw the viewer using the current hide-ceiling toggle without touching the underlying file
         if len(self._raw_pos) == 0:
             self.point_cloud_item.setData(pos=np.zeros((0, 3), dtype=np.float32))
@@ -1604,16 +1708,25 @@ class SinglePLYViewport(QWidget):
 
         pos = self._raw_pos
         color = self._raw_color
+        sel_mask = self._selected_mask
+
         if self.hide_ceiling_enabled and self._ceiling_cut_height is not None:
             keep = pos[:, 2] < float(self._ceiling_cut_height)
             if int(np.count_nonzero(keep)) >= max(100, int(len(pos) * 0.55)):
                 pos = pos[keep]
                 color = color[keep]
+                if sel_mask is not None:
+                    sel_mask = sel_mask[keep]
 
         mins = pos.min(axis=0)
         maxs = pos.max(axis=0)
         center = (mins + maxs) / 2.0
+        self._display_center = center.astype(np.float32)
         pos_local = (pos - center) * self._fit_scale
+
+        if sel_mask is not None and np.any(sel_mask):
+            color = color.copy()
+            color[sel_mask] = [1.0, 0.2, 0.2, 1.0]
 
         self.point_cloud_item.setData(
             pos=pos_local.astype(np.float32),
@@ -1625,7 +1738,8 @@ class SinglePLYViewport(QWidget):
         self._update_floor_plane(pos_local)
 
         self.file_loaded = True
-        self.view.setCameraPosition(distance=self._display_distance, elevation=18, azimuth=45)
+        if reset_camera:
+            self.view.setCameraPosition(distance=self._display_distance, elevation=18, azimuth=45)
         self.point_count_changed.emit(int(len(pos)))
 
     def set_hide_ceiling(self, enabled: bool):
@@ -1649,8 +1763,109 @@ class SinglePLYViewport(QWidget):
         #snap camera to a straight bottom-up view
         self.view.setCameraPosition(distance=self._display_distance, elevation=-90, azimuth=0)
 
+    def enter_lasso_mode(self):
+        self._lasso_active = True
+        self._lasso_overlay.setGeometry(self.view.rect())
+        self._lasso_overlay.raise_()
+        self._lasso_overlay.set_active(True)
+
+    def exit_lasso_mode(self):
+        self._lasso_active = False
+        self._lasso_overlay.set_active(False)
+
+    def _on_lasso_finished(self, polygon: list):
+        if len(self._raw_pos) == 0 or len(polygon) < 3:
+            return
+        pos_local = (self._raw_pos.astype(np.float64) - self._display_center.astype(np.float64)) * float(self._fit_scale)
+        screen_xy, valid = self._project_points_to_screen(pos_local)
+        poly = np.array(polygon, dtype=np.float64)
+        px = screen_xy[valid, 0].astype(np.float64)
+        py = screen_xy[valid, 1].astype(np.float64)
+        inside = _points_in_polygon_2d(px, py, poly)
+        new_mask = np.zeros(len(self._raw_pos), dtype=bool)
+        cand_idx = np.where(valid)[0]
+        new_mask[cand_idx[inside]] = True
+        self._selected_mask = new_mask
+        self.selection_changed.emit(int(np.sum(new_mask)))
+        self._refresh_display(reset_camera=False)
+
+    def _project_points_to_screen(self, pos_local: np.ndarray) -> tuple:
+        #project display-local 3d points to widget pixel coords using current camera opts
+        if len(pos_local) == 0:
+            return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=bool)
+        opts = self.view.opts
+        distance = float(opts.get("distance", 25.0))
+        elevation = float(opts.get("elevation", 18.0))
+        azimuth = float(opts.get("azimuth", 45.0))
+        fov = float(opts.get("fov", 60.0))
+        center = opts.get("center", None)
+        cx = cy = cz = 0.0
+        if center is not None:
+            try:
+                cx, cy, cz = float(center.x()), float(center.y()), float(center.z())
+            except Exception:
+                pass
+        ww = max(self.view.width(), 1)
+        wh = max(self.view.height(), 1)
+        az = np.radians(azimuth)
+        el = np.radians(elevation - 90.0)
+        Rz = np.array([[np.cos(az), -np.sin(az), 0, 0],
+                       [np.sin(az),  np.cos(az), 0, 0],
+                       [0,           0,           1, 0],
+                       [0,           0,           0, 1]], dtype=np.float64)
+        Rx = np.array([[1, 0,          0,           0],
+                       [0, np.cos(el), -np.sin(el), 0],
+                       [0, np.sin(el),  np.cos(el), 0],
+                       [0, 0,           0,           1]], dtype=np.float64)
+        Tc = np.array([[1, 0, 0, -cx],
+                       [0, 1, 0, -cy],
+                       [0, 0, 1, -cz],
+                       [0, 0, 0,   1]], dtype=np.float64)
+        Td = np.array([[1, 0, 0,       0],
+                       [0, 1, 0,       0],
+                       [0, 0, 1, -distance],
+                       [0, 0, 0,       1]], dtype=np.float64)
+        V = Td @ Rx @ Rz @ Tc
+        aspect = ww / wh
+        f = 1.0 / np.tan(np.radians(fov / 2.0))
+        near, far = 0.1, 100000.0
+        P = np.array([[f / aspect, 0, 0,                          0],
+                      [0,          f, 0,                          0],
+                      [0,          0, -(far + near) / (far - near), -2 * far * near / (far - near)],
+                      [0,          0, -1,                          0]], dtype=np.float64)
+        MVP = P @ V
+        n = len(pos_local)
+        pts = np.ones((4, n), dtype=np.float64)
+        pts[:3, :] = pos_local.T
+        clip = MVP @ pts
+        w_c = clip[3, :]
+        valid = w_c > 1e-6
+        screen = np.zeros((n, 2), dtype=np.float32)
+        m = valid
+        screen[m, 0] = ((clip[0, m] / w_c[m] + 1.0) / 2.0 * ww).astype(np.float32)
+        screen[m, 1] = ((1.0 - clip[1, m] / w_c[m]) / 2.0 * wh).astype(np.float32)
+        return screen, valid
+
+    def delete_selected_points(self) -> int:
+        if self._selected_mask is None or not np.any(self._selected_mask):
+            return 0
+        n_deleted = int(np.sum(self._selected_mask))
+        keep = ~self._selected_mask
+        self._raw_pos = self._raw_pos[keep]
+        self._raw_color = self._raw_color[keep]
+        self._selected_mask = np.zeros(len(self._raw_pos), dtype=bool)
+        if len(self._raw_pos) > 0:
+            self._ceiling_cut_height = estimate_ceiling_cut_height(self._raw_pos[:, 2])
+        else:
+            self._ceiling_cut_height = None
+        self.selection_changed.emit(0)
+        self._refresh_display(reset_camera=False)
+        return n_deleted
+
     def clear_view(self):
         #wipe the current point cloud from the viewer
+        self.exit_lasso_mode()
+        self._selected_mask = None
         self._raw_pos = np.zeros((0, 3), dtype=np.float32)
         self._raw_color = np.zeros((0, 4), dtype=np.float32)
         self._ceiling_cut_height = None
@@ -1660,9 +1875,12 @@ class SinglePLYViewport(QWidget):
         self.floor_plane_item.setSize(x=1.0, y=1.0)
         self.file_loaded = False
         self.point_count_changed.emit(0)
+        self.selection_changed.emit(0)
 
     def load_ply(self, path: str):
         #load one ply, fit it into view, and replace the current scan
+        self.exit_lasso_mode()
+        self._selected_mask = None
         data = read_ply_data(path)
         pos = data["xyz"]
         if pos.size == 0:
@@ -1675,6 +1893,7 @@ class SinglePLYViewport(QWidget):
         self._raw_pos = pos.astype(np.float32)
         self._raw_color = build_height_colors_rgba(pos).astype(np.float32)
         self._ceiling_cut_height = estimate_ceiling_cut_height(pos[:, 2])
+        self.selection_changed.emit(0)
         self._refresh_display()
 
 #===== SECTION 6: 3D VIEWPORT (SINGLE SCAN) END POINT =====
@@ -1991,6 +2210,31 @@ class LidarWindow(QMainWindow):
         render_layout.setColumnStretch(1, 1)
         self.right_layout.addWidget(render_group, 0)
 
+        manual_group = QGroupBox("Manual Cleanup")
+        manual_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        manual_layout = QVBoxLayout(manual_group)
+        manual_layout.setSpacing(6)
+
+        self.btn_select_region = QPushButton("Select Region")
+        self.btn_select_region.setCheckable(True)
+        self.btn_select_region.setMinimumHeight(36)
+        self.btn_select_region.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self.btn_delete_selected = QPushButton("Delete Selected")
+        self.btn_delete_selected.setMinimumHeight(36)
+        self.btn_delete_selected.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn_delete_selected.setEnabled(False)
+
+        self.selection_count_lbl = QLabel("No points selected.")
+        self.selection_count_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.selection_count_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self.selection_count_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+
+        manual_layout.addWidget(self.btn_select_region)
+        manual_layout.addWidget(self.btn_delete_selected)
+        manual_layout.addWidget(self.selection_count_lbl)
+        self.right_layout.addWidget(manual_group, 0)
+
         info_group = QGroupBox("File Info")
         info_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         info_layout = QVBoxLayout(info_group)
@@ -2062,7 +2306,57 @@ class LidarWindow(QMainWindow):
         self.btn_stitch.clicked.connect(self._stitch_clicked)
         self.btn_toggle_right.clicked.connect(self._toggle_right_panel)
         self.viewer3d.point_count_changed.connect(self._update_point_count_label)
+        self.btn_select_region.toggled.connect(self._select_region_toggled)
+        self.btn_delete_selected.clicked.connect(self._delete_manual_clicked)
+        self.viewer3d.selection_changed.connect(self._on_selection_changed)
         #===== SECTION 16: UI EVENTS END POINT =====
+
+    def _select_region_toggled(self, checked: bool):
+        if checked:
+            if not self.viewer3d.file_loaded:
+                self.btn_select_region.blockSignals(True)
+                self.btn_select_region.setChecked(False)
+                self.btn_select_region.blockSignals(False)
+                self._log("manual cleanup: load a scan first.")
+                return
+            self.viewer3d.enter_lasso_mode()
+            self.btn_select_region.setText("Cancel Selection")
+            self._log("manual cleanup: draw around the points to delete, then release.")
+        else:
+            self.viewer3d.exit_lasso_mode()
+            self.btn_select_region.setText("Select Region")
+
+    def _delete_manual_clicked(self):
+        n_deleted = self.viewer3d.delete_selected_points()
+        if n_deleted == 0:
+            self._log("manual cleanup: no points selected.")
+            return
+        if not self.current_loaded_path:
+            self._log(f"manual cleanup: removed {n_deleted:,} points (no file to save).")
+            return
+        xyz = self.viewer3d._raw_pos
+        color_rgba = self.viewer3d._raw_color
+        rgb_u8 = (color_rgba[:, :3] * 255.0).clip(0, 255).astype(np.uint8)
+        output_path = build_short_output_path(self.current_loaded_path, ["m"])
+        write_ply_xyzrgb_ascii(output_path, xyz, rgb_u8)
+        self._add_queue_item(os.path.basename(output_path), output_path)
+        self.current_loaded_path = output_path
+        self.info_lbl.setText(f"Loaded:\n{os.path.basename(output_path)}")
+        self._log(f"manual cleanup: removed {n_deleted:,} points, saved {os.path.basename(output_path)}")
+
+    def _on_selection_changed(self, count: int):
+        self.btn_delete_selected.setEnabled(count > 0)
+        if count > 0:
+            self.selection_count_lbl.setText(f"{count:,} points selected")
+            #auto-exit lasso mode so the camera can be orbited to inspect selection
+            if self.btn_select_region.isChecked():
+                self.btn_select_region.blockSignals(True)
+                self.btn_select_region.setChecked(False)
+                self.btn_select_region.blockSignals(False)
+                self.btn_select_region.setText("Select Region")
+                self.viewer3d.exit_lasso_mode()
+        else:
+            self.selection_count_lbl.setText("No points selected.")
 
     def _get_selected_queue_paths(self) -> List[str]:
         #return valid file paths for all currently selected queue items

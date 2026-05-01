@@ -1,15 +1,16 @@
-# Laptop (interface.py)
+# Both Laptop and Raspberry Pi
+numpy
+
+# Only the Laptop (interface.py)
 PyQt6
 pyqtgraph
 PyOpenGL
 PyOpenGL_accelerate
-numpy
-# Open3D wheels are not consistently available for Python 3.13 on Windows.
-# Keep it automatic on supported interpreters and skip on 3.13 to avoid install failure.
 open3d; python_version < "3.13"
 
-# Raspberry Pi (myLivox360.py, test_lidar.py, sender.py)
-# numpy       <- already listed above
+# Only the Raspberry Pi (myLivox360.py, test_lidar.py, sender.py)
 matplotlib
 opencv-python
 plyfile
+
+# Please comment out the requirements that are not needed for the specific device during your install!
