@@ -44,11 +44,6 @@ Clone the repository to Raspberry pi and laptop
 git clone https://github.com/OfficiallyG/LIDAR-Image-Generation-and-Stitching 
 ```
 
-### Laptop setup
-
-1. Download the interface.py an open it with a IDE and make sure to install all of the necessary import packages at the start of the code.
-2. Run the file and the interface window should appear.
-
 ### Raspberry Pi setup
 
 1. Clone the [Livox SDK](github.com/Livox-SDK/Livox-SDK2) and the [Input Remapper](https://github.com/sezanzeb/input-remapper) repositories to the device.
@@ -66,12 +61,28 @@ git clone https://github.com/sezanzeb/input-remapper
 
 **For Livox Mid360, the default device IP address is usually 192.168.1.1XX, XX being the last 2 digits of the serial number of the device.**
 
+3. For controller device setup, refer to [Input Remapper](https://github.com/sezanzeb/input-remapper) repository for instructions. 
+
 
 
 
 
 
 ### Laptop Setup
-1. Make sure Raspberry Pi device and laptop are on the same network
+1. Make sure Raspberry Pi device and laptop are on the same network.
 
+2. Navigate to the directory you cloned the repository to.
+
+3. create a virtual environment if not already created, and start the virtual environment.
+
+4. Uncomment and install the requirements outlined in the LAPTOP-SPECIFIC section of requirements.txt.
+```bash
+pip install -r requirements.txt
+```
+
+5. Run the interface.py file.
+
+```bash
+python interface.py
+```
 
