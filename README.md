@@ -44,7 +44,10 @@ Clone the repository to Raspberry pi and laptop
 git clone https://github.com/OfficiallyG/LIDAR-Image-Generation-and-Stitching 
 ```
 
+### Laptop setup
 
+1. Download the interface.py an open it with a IDE and make sure to install all of the necessary import packages at the start of the code.
+2. Run the file and the interface window should appear.
 
 ### Raspberry Pi setup
 
