@@ -1,13 +1,12 @@
 # LIDAR-Image-Generation-and-Stitching
 This Project was developed for the Polk County Sherrifs Department via the Capstone Design course at Florida Polytechnic University.
 
-This project has 4 files in total all of which use the Python programming language.
 
 ## **WARNING**
 
 This project was made with the **Livox Mid360** in mind and may not work with other lidar scanning devices.
 
-This protect also utilizes a Raspberry Pi 5, flashed with PiOS on 64-bit Bookworm.
+This project also utilizes a **Raspberry Pi 5**, flashed with PiOS on 64-bit Bookworm
 
 ## Files in this repo:
 
@@ -15,14 +14,18 @@ This protect also utilizes a Raspberry Pi 5, flashed with PiOS on 64-bit Bookwor
 - **myLivox360.py**
 - **sender.py**
 - **test_lidar.py**
+- **senderconfig.ini**
+- **requirements.txt**
+- **setup.md**
 
 ## Recieving laptop files: 
-- interface.py
+- **interface.py**
 
 ## Raspberry pi Files: 
-- mylivox360.py 
-- test_lidar.py 
-- sender.py
+- **myLivox360.py**
+- **test_lidar.py** 
+- **sender.py**
+- **senderconfig.ini**
 
 ## File Descriptions
 
@@ -35,12 +38,15 @@ This file reads the output from the LiDAR scanner and creates the image that wil
 ### sender.py: 
 This file lets the Raspberry Pi send the resulting .ply file from the device to the receiving laptop.
 
+### senderconfig.ini
+This file is the configuration file for the sender.py IP address, port, and device number.
+
 ### test_lidar.py: 
 This file is what displays the live feed from the lidar and allows the user to send a snapshot of what is currently scanned. This is then saved as a .ply file in the outgoing files folder and sent to the laptop using sender.py.
 
 
 ## Instructions
-Clone the repository to Raspberry pi and laptop
+- Clone the repository to Raspberry pi and laptop
 
 ```bash
 git clone https://github.com/OfficiallyG/LIDAR-Image-Generation-and-Stitching 
@@ -48,36 +54,16 @@ git clone https://github.com/OfficiallyG/LIDAR-Image-Generation-and-Stitching
 
 ### Raspberry Pi setup
 
-1. Clone the [Livox SDK](github.com/Livox-SDK/Livox-SDK2) and the [Input Remapper](https://github.com/sezanzeb/input-remapper) repositories to the device.
-
-```bash
-git clone https://github.com/Livox-SDK/Livox-SDK2.git
-```
-
-```bash
-git clone https://github.com/sezanzeb/input-remapper
-```
-
-2. Follow the instructions on the Livox SDK repo to make sure lidar device is working.
-    - you may need to edit the IP address in myLivox360.py if your device doesn't match the ip in the file.
-
-**For Livox Mid360, the default device IP address is usually 192.168.1.1XX, XX being the last 2 digits of the serial number of the device.**
-
-3. For controller device setup, refer to [Input Remapper](https://github.com/sezanzeb/input-remapper) repository for instructions. 
-
-
-
-
-
+- Refer to setup.md for Raspberry Pi setup instructions.
 
 ### Laptop Setup
 1. Make sure Raspberry Pi device and laptop are on the same network.
 
 2. Navigate to the directory you cloned the repository to.
 
-3. create a virtual environment if not already created, and start the virtual environment.
+3. Create a virtual environment if not already created, and start the virtual environment.
 
-4. Uncomment and install the requirements outlined in the LAPTOP-SPECIFIC section of requirements.txt.
+4. Uncomment and install the requirements outlined in the **Laptop** section of requirements.txt.
 ```bash
 pip install -r requirements.txt
 ```
