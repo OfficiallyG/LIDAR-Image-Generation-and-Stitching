@@ -7,6 +7,8 @@ This project has 4 files in total all of which use the Python programming langua
 
 This project was made with the **Livox Mid360** in mind and may not work with other lidar scanning devices.
 
+This protect also utilizes a Raspberry Pi 5, flashed with PiOS on 64-bit Bookworm.
+
 ## Files in this repo:
 
 - **interface.py**

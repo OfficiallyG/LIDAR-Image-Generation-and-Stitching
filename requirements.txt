@@ -4,19 +4,24 @@
 # - Raspberry Pi (myLivox360.py, sender.py, test_lidar.py): numpy, opencv-python, matplotlib, plyfile
 # - Laptop (interface.py, stitch.py): PyQt6, pyqtgraph, numpy, opencv-python, matplotlib, open3d, plyfile
 
-# ===== SHARED DEPENDENCIES (both Raspberry Pi and Laptop) =====
+
+# Please comment out the requirements that are not needed for the specific device during your install!
+
+# Shared
 numpy>=1.21.0
 plyfile>=0.7.3
 matplotlib>=3.3.0
 
-# ===== RASPBERRY PI SPECIFIC =====
+# Raspberry Pi
 opencv-python>=4.5.0
 
-# ===== LAPTOP SPECIFIC (for interface.py) =====
-# Uncomment these lines if running on your laptop/desktop
+
+# Laptop
 #PyQt6>=6.0.0
 #PyQt6-Qt6>=6.0.0
 #pyqtgraph>=0.12.0
 #opencv-python>=4.5.0
 #open3d>=0.13.0
 
+
+# Please comment out the requirements that are not needed for the specific device during your install!
